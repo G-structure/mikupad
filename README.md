@@ -1,6 +1,6 @@
 # mikupad
 
-**mikupad** is a user-friendly, browser-based interface for interacting with language models. It's built with ReactJS and supports various text generation backends, all within a single HTML file.
+**mikupad** is a user-friendly, browser-based interface for interacting with language models. It's built with ReactJS and supports various text generation backends, all within a simple HTML file, stylesheet, import map, and scripts.
 
 ![image](https://github.com/user-attachments/assets/4c5fa8ff-5926-4a4b-807b-34e4f36a032c)
 
@@ -25,14 +25,14 @@
 
 ## Getting Started
 
-You can easily run **mikupad** by opening the `mikupad.html` file in your web browser. No additional installation is required. Choose your preferred backend and start generating text!
+You can easily run **mikupad** by opening the `mikupad.html` file in your web browser. Keep `mikupad.css`, `importmap.json`, and `mikupad.js` alongside it. No additional installation is required. Choose your preferred backend and start generating text!
 
 ```shell
 git clone https://github.com/lmg-anon/mikupad.git
 cd mikupad
 open mikupad.html
 ```
-To use **mikupad** fully offline, run the provided `compile` script or download the pre-compiled `mikupad_compiled.html` file from [Releases](https://github.com/lmg-anon/mikupad/releases/latest).
+To use **mikupad** fully offline, run the provided `compile` script or download the pre-compiled `mikupad_compiled.html` file from [Releases](https://github.com/lmg-anon/mikupad/releases/latest). The compiled build bundles the app with Parcel, producing `mikupad_compiled.html`, `mikupad_compiled.css`, and `mikupad_compiled.js` so it can run without external dependencies.
 
 You can also [try it on GitHub Pages](https://lmg-anon.github.io/mikupad/mikupad.html).
 
