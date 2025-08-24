@@ -1,10 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `mikupad.html`: Single‑file web app (React + htm). Build target.
+- `mikupad.html`: Source HTML for the web app (React + htm).
+- `mikupad.css`: Base stylesheet linked from `mikupad.html`.
+- `mikupad.js`: React logic and components.
+- `importmap.json`: Module map resolving external dependencies.
 - `project/`: Parcel project wrapper; `package.json` with `start`/`build`.
 - `server/`: Express + SQLite API and proxy; `server.js`, `start.sh|.bat`.
-- `compile.sh|.bat`: Builds `mikupad_compiled.html` via Parcel.
+- `compile.sh|.bat`: Bundles `mikupad.html`/`mikupad.css`/`mikupad.js` into `mikupad_compiled.html`, `mikupad_compiled.css`, and `mikupad_compiled.js`.
 - `.github/workflows/`: Release workflow that compiles on push to `main`.
 
 ## Build, Test, and Development Commands
@@ -30,6 +33,7 @@
 - Commits: imperative, concise subject (≤72 chars). Example: `feat(server): add /sessions listing`.
 - PRs: include a clear description, linked issues, and screenshots for UI changes. Note any server/API changes and manual test steps.
 - Build: ensure `./compile.sh` succeeds locally; CI will compile on `main` and attach `mikupad_compiled.html` to the release.
+- Do not commit generated `mikupad_compiled.*` artifacts; they are built for releases.
 
 ## Security & Configuration Tips
 - Protect the server with `MIKUPAD_LOGIN`/`MIKUPAD_PASSWORD` when exposing beyond localhost.

@@ -1,7 +1,12 @@
 server/web-session-storage.db
 package-lock.json
 project/mikupad.html
+project/mikupad.css
+project/*.js
+project/*.json
 mikupad_compiled.html
+mikupad_compiled.css
+mikupad_compiled.js
 
 # Logs
 logs

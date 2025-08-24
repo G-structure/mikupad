@@ -11,10 +11,22 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+del /q project\mikupad.html project\mikupad.css project\*.js project\importmap.json project\mikupad.importmap.json 2>nul
 xcopy /y mikupad.html project >NUL
+xcopy /y mikupad.css project >NUL
+xcopy /y *.js project >NUL
+xcopy /y importmap.json project >NUL
 
 cd project
 call npm install
-call npm start build
+call npm run build
+for %%f in (dist\mikupad*.js) do (
+    findstr /C:"module.exports=JSON.parse" "%%f" >nul && (
+        del "%%f"
+        del "%%f.map" 2>nul
+    )
+)
 copy /y .\dist\mikupad.html ..\mikupad_compiled.html
+copy /y .\dist\mikupad*.css ..\mikupad_compiled.css
+copy /y .\dist\mikupad*.js ..\mikupad_compiled.js
 cd ..

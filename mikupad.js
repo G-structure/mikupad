@@ -1,0 +1,6686 @@
+
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { html } from 'htm/react';
+import { SVResizeObserver } from 'scrollview-resize';
+
+const API_LLAMA_CPP = 0;
+const API_KOBOLD_CPP = 2;
+const API_OPENAI_COMPAT = 3;
+const API_AI_HORDE = 4;
+
+// Polyfill for piece of shit Chromium
+if (!(Symbol.asyncIterator in ReadableStream.prototype)) {
+	ReadableStream.prototype[Symbol.asyncIterator] = async function* () {
+		const reader = this.getReader();
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done)
+					return;
+				yield value;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	};
+}
+
+function exportText(filename, text) {
+	const textBlob = new Blob([text], {type: 'text/plain;charset=utf-8'});
+	const textURL = URL.createObjectURL(textBlob);
+	var element = document.createElement('a');
+	element.setAttribute('href', textURL);
+	element.setAttribute('download', filename);
+	element.style.display = 'none';
+	document.body.appendChild(element);
+	element.click();
+	URL.revokeObjectURL(textURL);
+	document.body.removeChild(element);
+}
+
+function normalizeEndpoint(endpoint, endpointAPI) {
+	const url = new URL(endpoint.trim());
+	url.pathname = url.pathname.replace(/\/+/g, "/"); // normalize consecutive slashes
+
+	let urlString = url.toString();
+	if (endpointAPI == API_OPENAI_COMPAT)
+		urlString = urlString.replace(/\/v1\/?$/, ""); // remove "/v1" from the end of the string
+	if (endpointAPI == API_KOBOLD_CPP)
+		urlString = urlString.replace(/\/api\/?$/, ""); // remove "/api" from the end of the string
+	if (endpointAPI == API_AI_HORDE)
+		urlString = "https://aihorde.net/api";
+	urlString = urlString.replace(/\/$/, ""); // remove "/" from the end of the string
+
+	return urlString;
+}
+
+export async function getTokenCount({ endpoint, endpointAPI, endpointAPIKey, signal, ...options }) {
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_LLAMA_CPP:
+			return await llamaCppTokenCount({ endpoint, endpointAPIKey, signal, ...options });
+		case API_KOBOLD_CPP:
+			return await koboldCppTokenCount({ endpoint, endpointAPIKey, signal, ...options });
+		case API_OPENAI_COMPAT:
+			// These endpoints don't have a token count endpoint...
+			if (new URL(endpoint).host === 'api.openai.com' || new URL(endpoint).host === 'api.together.xyz')
+				return 0;
+
+			// Each backend that exposes an OpenAI-compatible API may have a different token count endpoint.
+			// Instead of asking the user which backend they are using, let's try each one.
+			let tokenCount = 0;
+			tokenCount = await openaiAphroditeTokenCount({ endpoint, endpointAPIKey, signal, ...options });
+			if (tokenCount != -1)
+				return tokenCount;
+			tokenCount = await openaiOobaTokenCount({ endpoint, signal, ...options });
+			if (tokenCount != -1)
+				return tokenCount;
+			tokenCount = await openaiTabbyTokenCount({ endpoint, endpointAPIKey, signal, ...options });
+			if (tokenCount != -1)
+				return tokenCount;
+			return 0;
+		default:
+			return 0;
+	}
+}
+
+export async function getTokens({ endpoint, endpointAPI, endpointAPIKey, signal, ...options }) {
+	// currently only implemented for llama.cpp and koboldcpp
+	// returns a json object in the format of:
+	// { ids:[ array of token ids ], str:[ array of detokenized ids ] }
+	// example: { ids:[9288,4731],str:["test"," string"] }
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_LLAMA_CPP:
+			return await llamaCppTokenize({ endpoint, endpointAPIKey, signal, ...options });
+		case API_KOBOLD_CPP:
+			return await koboldCppTokenize({ endpoint, endpointAPIKey, signal, ...options });
+		case API_OPENAI_COMPAT:
+			// These endpoints don't have a tokenenizer endpoint...
+			if (new URL(endpoint).host === 'api.openai.com' || new URL(endpoint).host === 'api.together.xyz')
+				return [];
+			
+			// Each backend that exposes an OpenAI-compatible API may have a different tokenizer endpoint.
+			// Instead of asking the user which backend they are using, let's try each one.
+			let tokens = null;
+			tokens = await openaiOobaTokenize({ endpoint, endpointAPIKey, signal, ...options });
+			if (tokens !== null)
+				return tokens;
+			tokens = await openaiTabbyTokenize({ endpoint, endpointAPIKey, signal, ...options });
+			if (tokens !== null)
+				return tokens;
+			return [];
+		default:
+			return [];
+	}
+}
+
+export async function getModels({ endpoint, endpointAPI, endpointAPIKey, signal, ...options }) {
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_OPENAI_COMPAT:
+			return await openaiModels({ endpoint, endpointAPIKey, signal, ...options });
+		case API_AI_HORDE:
+			return await aiHordeModels({ endpoint, endpointAPIKey, signal, ...options });
+		default:
+			return [];
+	}
+}
+
+export async function* completion({ endpoint, endpointAPI, endpointAPIKey, signal, ...options }) {
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_LLAMA_CPP:
+			return yield* await llamaCppCompletion({ endpoint, endpointAPIKey, signal, ...options });
+		case API_KOBOLD_CPP:
+			return yield* await koboldCppCompletion({ endpoint, endpointAPIKey, signal, ...options });
+		case API_OPENAI_COMPAT:
+			return yield* await openaiCompletion({ endpoint, endpointAPIKey, signal, ...options });
+		case API_AI_HORDE:
+			return yield* await aiHordeCompletion({ endpoint, endpointAPIKey, signal, ...options });
+	}
+}
+
+export async function* chatCompletion({ endpoint, endpointAPI, endpointAPIKey, signal, ...options }) {
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_OPENAI_COMPAT:
+			return yield* await openaiChatCompletion({ endpoint, endpointAPIKey, signal, ...options });
+	}
+}
+
+export async function abortCompletion({ endpoint, endpointAPI, ...options }) {
+	endpoint = normalizeEndpoint(endpoint, endpointAPI);
+	switch (endpointAPI) {
+		case API_KOBOLD_CPP:
+			return await koboldCppAbortCompletion({ endpoint, ...options });
+		case API_OPENAI_COMPAT:
+			return await openaiOobaAbortCompletion({ endpoint, ...options });
+		case API_AI_HORDE:
+			return await aiHordeAbortCompletion({ endpoint, ...options });
+	}
+}
+
+// Function to parse text/event-stream data and yield JSON objects
+async function* parseEventStream(eventStream) {
+	let buf = '';
+	let ignoreNextLf = false;
+
+	for await (let chunk of eventStream.pipeThrough(new TextDecoderStream())) {
+		// A CRLF could be split between chunks, so if the last chunk ended in
+		// CR and this chunk started with LF, trim the LF
+		if (ignoreNextLf && /^\n/.test(chunk)) {
+			chunk = chunk.slice(1);
+		}
+		ignoreNextLf = /\r$/.test(chunk);
+
+		// Event streams must be parsed line-by-line (ending in CR, LF, or CRLF)
+		const lines = (buf + chunk).split(/\n|\r\n?/);
+		buf = lines.pop();
+		let type, data;
+
+		for (const line of lines) {
+			if (!line) {
+				type = undefined;
+				data = undefined;
+				continue;
+			}
+			const { name, value } = /^(?<name>.*?)(?:: ?(?<value>.*))?$/s.exec(line).groups;
+			switch (name) {
+				case 'event':
+					type = (value ?? '');
+					break;
+				case 'data':
+					data = data === undefined ? (value ?? '') : `${data}\n${value}`;
+					break;
+			}
+			// We only emit message-type events for now (and assume JSON)
+			if (data && (type || 'message') === 'message') {
+				if (data === '[DONE]') {
+					// This is a hack because we aren't following exactly the spec...
+					break;
+				}
+				const json = JSON.parse(data);
+				if (json.error?.message) {
+					throw new Error(json.error.message);
+				}
+				// Both Chrome and Firefox suck at debugging
+				// text/event-stream, so make it easier by logging events
+				if (window.logSSEEvents) {
+					console.log('event', json);
+				}
+				yield json;
+				type = undefined;
+				data = undefined;
+			}
+		}
+	}
+}
+
+async function llamaCppTokenCount({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/tokenize`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify(options),
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+	const { tokens } = await res.json();
+	return tokens.length + 1; // + 1 for BOS, I guess.
+}
+
+async function llamaCppTokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/tokenize`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify(options),
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+	const { tokens } = await res.json();
+
+	const strings = [];
+	for (let i=0; i<tokens.length; i++) {
+		const string = await llamaCppDetokenize({
+				endpoint,
+				endpointAPIKey,
+				tokens: [ tokens[i] ],
+				signal: signal,
+		}); // maybe batch all tokens together with a bos token between them
+			// something? that'd probably be more efficient. don't know how
+			// to get the bos token ID though.
+		strings.push(string);
+	};
+	return {ids:tokens,str:strings};
+}
+async function llamaCppDetokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/detokenize`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify(options),
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+	const { content } = await res.json();
+	return content
+}
+
+async function* llamaCppCompletion({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/completion`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			...options,
+			cache_prompt: true,
+		}),
+		signal,
+	});
+
+	if (!res.ok) {
+		throw new Error(`HTTP ${res.status}`);
+	}
+
+	async function* yieldTokens(chunks) {
+		for await (const chunk of chunks) {
+			const token = chunk.content || chunk.token;
+			const choice = chunk.completion_probabilities?.[0];
+
+			const probs = choice?.probs ??
+				Object.values(choice?.top_logprobs || chunk.top_logprobs || {}).map(({ token, logprob }) => ({
+					tok_str: token,
+					prob: Math.exp(logprob)
+				}));
+			const prob = probs.find(p => p.tok_str === token)?.prob;
+
+			yield {
+				content: token,
+				...(probs.length > 0 ? {
+					prob: prob ?? -1,
+					completion_probabilities: [{
+						content: token,
+						probs
+					}]
+				} : {})
+			};
+		}
+	}
+
+	if (options.stream) {
+		yield* await yieldTokens(parseEventStream(res.body));
+	} else {
+		const { completion_probabilities } = await res.json();
+		yield* await yieldTokens(completion_probabilities);
+	}
+}
+
+async function koboldCppTokenCount({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/api/extra/tokencount`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			prompt: options.content
+		}),
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+	const { value } = await res.json();
+	return value;
+}
+
+async function koboldCppTokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/api/extra/tokencount`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			prompt: options.content
+		}),
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+	const { ids } = await res.json();
+	ids.shift() // kobold automatically adds a token, so we need to remove it
+	return {ids:ids,str:""};
+
+}
+
+function koboldCppConvertOptions(options, endpoint) {
+	const isHorde = endpoint.toLowerCase().includes("aihorde.net");
+	const swapOption = (lhs, rhs) => {
+		if (lhs in options) {
+			options[rhs] = options[lhs];
+			delete options[lhs];
+		}
+	};
+	if (options.n_predict === -1) {
+		options.n_predict = isHorde ? 512 : 1024;
+	}
+	if (options.n_predict < 16 && isHorde) {
+		options.n_predict = 16;
+	}
+	swapOption("n_ctx", "max_context_length");
+	swapOption("n_predict", "max_length");
+	swapOption("n_probs", "logprobs");
+	swapOption("repeat_penalty", "rep_pen");
+	swapOption("repeat_last_n", "rep_pen_range");
+	swapOption("tfs_z", "tfs");
+	swapOption("typical_p", "typical");
+	swapOption("seed", "sampler_seed");
+	swapOption("stop", "stop_sequence");
+	swapOption("ignore_eos", "use_default_badwordsids");
+	return options;
+}
+
+async function* koboldCppCompletion({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/api/${options.stream ? 'extra/generate/stream' : 'v1/generate'}`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			...(endpointAPIKey ? { 'Authorization': `Bearer ${endpointAPIKey}` } : {}),
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			...koboldCppConvertOptions(options, endpoint)
+		}),
+		signal,
+	});
+
+	if (!res.ok) {
+		throw new Error(`HTTP ${res.status}`);
+	}
+
+	async function* yieldTokens(chunks) {
+		for await (const chunk of chunks) {
+			const { token, top_logprobs } = chunk;
+
+			const probs = Object.values(top_logprobs ?? {}).map(({ token, logprob }) => ({
+				tok_str: token,
+				prob: Math.exp(logprob)
+			}));
+			const prob = probs.find(p => p.tok_str === token)?.prob;
+
+			yield {
+				content: token,
+				...(probs.length > 0 ? {
+					prob: prob ?? -1,
+					completion_probabilities: [{
+						content: token,
+						probs
+					}]
+				} : {})
+			};
+		}
+	}
+
+	if (options.stream) {
+		yield* await yieldTokens(parseEventStream(res.body));
+	} else {
+		const { results } = await res.json();
+		yield* await yieldTokens(results?.[0].logprobs?.content ?? []);
+	}
+}
+
+async function koboldCppAbortCompletion({ endpoint, proxyEndpoint, ...options }) {
+	try {
+		await fetch(`${proxyEndpoint ?? endpoint}/api/extra/abort`, {
+			method: 'POST',
+			headers: {
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+		});
+	} catch (e) {
+		reportError(e);
+	}
+}
+
+async function openaiAphroditeTokenCount({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/token/encode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${endpointAPIKey}`,
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify({
+				prompt: options.content
+			}),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const tokens = await res.json();
+		return tokens.length;
+	} catch (e) {
+		return -1;
+	}
+}
+
+async function openaiOobaTokenCount({ endpoint, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/internal/token-count`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify({
+				text: options.content
+			}),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const { length } = await res.json();
+		return length;
+	} catch (e) {
+		return -1;
+	}
+}
+
+async function openaiTabbyTokenCount({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/token/encode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${endpointAPIKey}`,
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify({
+				text: options.content
+			}),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const tokens = await res.json();
+		return tokens.length;
+	} catch (e) {
+		return -1;
+	}
+}
+
+async function openaiOobaTokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/internal/encode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify({
+				text: options.content
+			}),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const { tokens } = await res.json();
+
+		const strings = [];
+		for (let i=0; i<tokens.length; i++) {
+			const string = await openaiOobaDetokenize({
+					endpoint,
+					...(endpointAPIKey ? {
+						endpointAPIKey,
+					} : {}),
+					tokens: [ tokens[i] ],
+					signal: signal,
+			});
+			strings.push(string);
+		};
+		return {ids:tokens,str:strings};
+	} catch (e) {
+		return null;
+	}
+}
+async function openaiOobaDetokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/internal/decode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify(options),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const { text } = await res.json();
+		return text;
+	} catch (e) {
+		reportError(e);
+		return null;
+	}
+}
+
+async function openaiTabbyTokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/token/encode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify({
+				text: options.content
+			}),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const { tokens } = await res.json();
+
+		const strings = [];
+		for (let i=0; i<tokens.length; i++) {
+			const string = await openaiTabbyDetokenize({
+					endpoint,
+					...(endpointAPIKey ? {
+						endpointAPIKey,
+					} : {}),
+					tokens: [ tokens[i] ],
+					signal: signal,
+			});
+			strings.push(string);
+		};
+		return {ids:tokens,str:strings};
+	} catch (e) {
+		return null;
+	}
+}
+async function openaiTabbyDetokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	try {
+		const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/token/decode`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			body: JSON.stringify(options),
+			signal,
+		});
+		if (!res.ok)
+			throw new Error(`HTTP ${res.status}`);
+		const { text } = await res.json();
+		return text;
+	} catch (e) {
+		reportError(e);
+		return null;
+	}
+}
+
+async function openaiModels({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const isTogetherAI = endpoint.toLowerCase().includes("together.xyz");
+
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/models`, {
+		method: 'GET',
+		headers: {
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${endpointAPIKey}`,
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+
+	const response = await res.json();
+	let data;
+
+	if (isTogetherAI) {
+		// TogetherAI returns an array.
+		data = response;
+	} else {
+		data = response.data;
+	}
+	return data.map(item => item.id);
+}
+
+function openaiConvertOptions(options, endpoint, isChat) {
+	const isOpenAI = endpoint.toLowerCase().includes("openai.com");
+	const isTogetherAI = endpoint.toLowerCase().includes("together.xyz");
+	const isOpenRouter = endpoint.toLowerCase().includes("openrouter.ai");
+	const swapOption = (lhs, rhs) => {
+		if (lhs in options) {
+			options[rhs] = options[lhs];
+			delete options[lhs];
+		}
+	};
+	if (options.n_predict === -1) {
+		options.n_predict = 1024;
+	}
+	if (isOpenAI && options.n_probs > 5) {
+		options.n_probs = 5;
+	}
+	if (isTogetherAI && options.n_probs > 1) {
+		options.n_probs = 1;
+	}
+	if ("dynatemp_range" in options && options.dynatemp_range !== 0) {
+		// oobabooga specific.
+		options.dynamic_temperature = true;
+		options.dynatemp_low = Math.max(0, options.temperature - options.dynatemp_range);
+		options.dynatemp_high = Math.max(0, options.temperature + options.dynatemp_range);
+	}
+	if (!isOpenAI && options.temperature === 0) {
+		// oobabooga specific.
+		options.do_sample = false;
+	}
+	swapOption("n_ctx", "max_context_length");
+	swapOption("n_predict", "max_tokens");
+	if (isChat) {
+		options.logprobs = true;
+		swapOption("n_probs", "top_logprobs");
+	} else {
+		swapOption("n_probs", "logprobs");
+	}
+	swapOption("repeat_penalty", "repetition_penalty");
+	swapOption("repeat_last_n", "repetition_penalty_range");
+	swapOption("tfs_z", "tfs");
+	swapOption("mirostat", "mirostat_mode");
+	swapOption("ignore_eos", "ban_eos_token");
+	swapOption("grammar", "grammar_string");
+	return options;
+}
+
+async function* openaiCompletion({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/completions`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${endpointAPIKey}`,
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			...openaiConvertOptions(options, endpoint)
+		}),
+		signal,
+	});
+
+	if (!res.ok) {
+		let json;
+		try {
+			json = await res.json();
+		} catch {}
+		if (json?.error?.message) {
+			throw new Error(json.error.message);
+		}
+		throw new Error(`HTTP ${res.status}`);
+	}
+
+	async function* yieldTokens(chunks) {
+		for await (const chunk of chunks) {
+			if (!chunk.choices || chunk.choices.length === 0) {
+				if (chunk.content) yield { content: chunk.content };
+				continue;
+			}
+
+			const { text, logprobs } = chunk.choices[0];
+			const top_logprobs = logprobs?.top_logprobs?.[0] ?? {};
+
+			const probs = Object.entries(top_logprobs).map(([tok, logprob]) => ({
+				tok_str: tok,
+				prob: Math.exp(logprob)
+			}));
+			const prob = probs.find(p => p.tok_str === text)?.prob;
+
+			yield {
+				content: text,
+				...(probs.length > 0 ? {
+					prob: prob ?? -1,
+					completion_probabilities: [{
+						content: text,
+						probs
+					}]
+				} : {})
+			};
+		}
+	}
+
+	if (options.stream) {
+		yield* await yieldTokens(parseEventStream(res.body));
+	} else {
+		const { content, choices } = await res.json();
+		if (choices?.[0].logprobs?.tokens) {
+			const logprobs = choices[0].logprobs;
+			const chunks = Object.values(logprobs.tokens).map((token, i) => ({
+				choices: [{
+					text: token,
+					logprobs: { top_logprobs: [logprobs.top_logprobs[i]] }
+				}]
+			}));
+			yield* await yieldTokens(chunks);
+		} else if (choices?.[0].text) {
+			yield { content: choices[0].text };
+		} else if (content) { // llama.cpp specific?
+			yield { content };
+		}
+	}
+}
+
+async function* openaiBufferUtf8Stream(stream) {
+	const decoder = new TextDecoder('utf-8', { fatal: false });
+
+	function parseEscapedString(escapedStr) {
+		return new Uint8Array(
+			escapedStr
+				.split('\\x')
+				.slice(1)
+				.map(hex => parseInt(hex, 16))
+		);
+	}
+
+	const hasEscapedSequence = str => /\\x[0-9a-fA-F]{2}/.test(str);
+	const encoder = new TextEncoder();
+
+	for await (const chunk of stream) {
+		const content = chunk?.choices?.[0]?.delta?.content ?? chunk?.choices?.[0]?.text;
+
+		if (!content) {
+			yield chunk;
+			continue;
+		}
+
+		const binaryData = hasEscapedSequence(content)
+			? parseEscapedString(content)
+			: encoder.encode(content);
+
+		const decoded = decoder.decode(binaryData, { stream: true });
+
+		yield {
+			...chunk,
+			choices: [{
+				...chunk.choices[0],
+				...(chunk.choices[0].delta
+					? { delta: { ...chunk.choices[0].delta, content: decoded } }
+					: { text: decoded }
+				)
+			}]
+		};
+	}
+}
+
+async function* openaiChatCompletion({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/v1/chat/completions`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${endpointAPIKey}`,
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			...openaiConvertOptions(options, endpoint, true)
+		}),
+		signal,
+	});
+
+	if (!res.ok) {
+		let json;
+		try {
+			json = await res.json();
+		} catch {}
+		if (json?.error?.message) {
+			throw new Error(json.error.message);
+		}
+		throw new Error(`HTTP ${res.status}`);
+	}
+
+	async function* yieldTokens(chunks) {
+		for await (const chunk of chunks) {
+			const token = chunk.choices[0].delta.content;
+			const top_logprobs = chunk.choices[0].logprobs?.content?.[0]?.top_logprobs ?? {};
+			if (!token) continue;
+
+			const probs = Object.values(top_logprobs).map(({ token, logprob }) => ({
+				tok_str: token,
+				prob: Math.exp(logprob)
+			}));
+			const prob = probs.find(p => p.tok_str === token)?.prob;
+
+			yield {
+				content: token,
+				...(probs.length > 0 ? {
+					prob: prob ?? -1,
+					completion_probabilities: [{
+						content: token,
+						probs
+					}]
+				} : {})
+			};
+		}
+	}
+
+	if (options.stream) {
+		yield* await yieldTokens(parseEventStream(res.body));
+	} else {
+		const { choices } = await res.json();
+		const chunks = choices?.[0].logprobs?.content;
+
+		if (chunks?.length) {
+			const formattedChunks = chunks.map(chunk => ({
+				choices: [{
+					delta: { content: chunk.token },
+					logprobs: { content: [{ top_logprobs: chunk.top_logprobs }] }
+				}]
+			}));
+			yield* await yieldTokens(openaiBufferUtf8Stream(formattedChunks));
+		} else if (choices?.[0].message?.content) {
+			yield { content: choices[0].message.content };
+		}
+	}
+}
+
+async function openaiOobaAbortCompletion({ endpoint, proxyEndpoint, ...options }) {
+	try {
+		await fetch(`${proxyEndpoint ?? endpoint}/v1/internal/stop-generation`, {
+			method: 'POST',
+			headers: {
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+		});
+	} catch (e) {
+		// do nothing
+	}
+}
+
+async function aiHordeModels({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const res = await fetch(`${proxyEndpoint ?? endpoint}/v2/status/models?type=text`, {
+		method: 'GET',
+		headers: {
+			'Content-Type': 'application/json',
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		signal,
+	});
+
+	if (!res.ok)
+		throw new Error(`HTTP ${res.status}`);
+
+	const response = await res.json();
+
+	return response
+		.filter(model => model.type === "text")
+		.map(model => model.name);
+}
+
+async function* aiHordeCompletion({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
+	const { model, prompt, ...params } = options;
+	const submitRes = await fetch(`${proxyEndpoint ?? endpoint}/v2/generate/text/async`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Apikey': endpointAPIKey?.trim() ? endpointAPIKey : '0000000000',
+			...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+		},
+		body: JSON.stringify({
+			...(model ? { models: [model] } : {}),
+			params: { ...koboldCppConvertOptions(params, endpoint) },
+			prompt: prompt
+		}),
+		signal,
+	});
+	if (!submitRes.ok)
+		throw new Error(`HTTP ${submitRes.status}`);
+	const { id: taskId } = await submitRes.json();
+
+	yield { status: 'queue_init', taskId: taskId };
+
+	// Poll for results
+	while (true) {
+		const checkRes = await fetch(`${proxyEndpoint ?? endpoint}/v2/generate/text/status/${taskId}`, {
+			headers: {
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+			signal,
+		});
+
+		if (!checkRes.ok)
+			throw new Error(`HTTP ${checkRes.status}`);
+		const status = await checkRes.json();
+
+		yield { status: 'queue_status', position: status.queue_position, waitTime: status.wait_time, processing: status.processing };
+
+		if (status.done) {
+			if (status.generations && status.generations.length > 0) {
+				yield { status: 'done', content: status.generations[0].text };
+			}
+			break;
+		}
+
+		// Wait before polling again
+		await new Promise(resolve => setTimeout(resolve, 1000));
+	}
+}
+
+async function aiHordeAbortCompletion({ endpoint, proxyEndpoint, hordeTaskId, ...options }) {
+	try {
+		await fetch(`${proxyEndpoint ?? endpoint}/v2/generate/text/status/${hordeTaskId}`, {
+			method: 'DELETE',
+			headers: {
+				...(proxyEndpoint ? { 'X-Real-URL': endpoint } : {})
+			},
+		});
+	} catch (e) {
+		reportError(e);
+	}
+}
+
+function importSillyTavernWorldInfo(json, setWorldInfo, importBehavior) {
+	setWorldInfo(prevWorldInfo => {
+		let updatedEntries;
+
+		if (importBehavior === "replace") {
+			updatedEntries = [];
+		} else if (importBehavior === "append") {
+			updatedEntries = [...prevWorldInfo.entries];
+		} else {
+			throw new Error("Unknown import behavior " + importBehavior);
+			return;
+		}
+
+		Object.values(json.entries)?.forEach(entry => {
+			updatedEntries.push({
+				"displayName": entry.comment,
+				"text": entry.content,
+				"keys": [...entry.key],
+				"search": entry.scanDepth || ""
+			});
+		});
+
+		return {
+			...prevWorldInfo,
+			entries: updatedEntries
+		};
+	});
+}
+
+function InputSlider({ label, value, min = 0, max = 100, step = 1, readOnly, hidden, strict, onValueChange, ...props }) {
+	const handleChange = (newValue) => {
+		if (strict) {
+			if (newValue < min) newValue = min;
+			if (newValue > max) newValue = max;
+		}
+		onValueChange(newValue);
+	};
+
+	return html`
+		<label className="InputBox" style=${hidden ? {'display': 'none'} : {}}>
+			${label}
+			<div className="InputSlider-container">
+				<input
+					type="range"
+					value=${value}
+					min=${min}
+					max=${max}
+					step=${step}
+					disabled=${readOnly}
+					onInput=${({ target }) => handleChange(Number(target.value))}/>
+				<input
+					type="number"
+					value=${value}
+					min=${min}
+					max=${max}
+					step=${step}
+					readOnly=${readOnly}
+					onChange=${({ target }) => handleChange(Number(target.value))}
+					...${props}/>
+			</div>
+		</label>`;
+}
+
+function InputBox({ label, className, tooltip, tooltipSize, value, type, datalist, onValueChange, children, ...props }) {
+	return html`
+		<label className="InputBox ${tooltip ? 'tooltip' : ''}">
+			${label}
+			<div className="${children ? 'hbox-flex' : ''}">
+				<input
+					className="flex1 ${className}"
+					type=${type || 'text'}
+					list="${datalist ? label : ''}"
+					value=${value}
+					size="1"
+					onChange=${({ target }) => {
+						let value = type === 'number' ? target.valueAsNumber : target.value;
+						if (props.inputmode === 'numeric') {
+							props.pattern = '^-?[0-9]*$';
+							if (value && !isNaN(+value))
+								value = +target.value;
+						}
+						if (props.pattern && !new RegExp(props.pattern).test(value))
+							return;
+						onValueChange(value);
+					}}
+					...${props}/>
+				${children}
+			</div>
+			${datalist && html`
+				<datalist id="${label}">
+					${datalist.map(opt => html`
+						<option key="${opt}">
+							${opt}
+						</option>`)}
+				</datalist>`}
+			${tooltip && html`
+				<span class="tooltiptext ${tooltipSize || ''}">
+					${tooltip}
+				</span>`}
+		</label>`;
+}
+
+function SelectBox({ label, value, hidden, onValueChange, options, ...props }) {
+	return html`
+		<label className="SelectBox" style=${hidden ? {'display': 'none'} : {}}>
+			${label}
+			<select
+				value=${value}
+				onChange=${({ target }) => onValueChange(JSON.parse(target.value))}
+				...${props}>
+				${(options = typeof options === 'function' ? options() : options).map(o => html`<option
+					key=${JSON.stringify(o.value)}
+					value=${JSON.stringify(o.value)}>${o.name}</option>`)}
+			</select>
+		</label>`;
+}
+function SelectBoxTemplate({ label, value, onValueChange, options, ...props }) {
+	return html`
+		<label className="SelectBox">
+			${label}
+			<select
+				value=${value}
+				onChange=${({ target }) => onValueChange(JSON.parse(JSON.stringify(target.value)))}
+				...${props}>
+				${(options = typeof options === 'function' ? options() : options).map(o => html`<option
+					key=${JSON.stringify(o.value)}
+					value=${o.nameNew}>${o.nameNew}</option>`)}
+			</select>
+		</label>`;
+}
+
+function Checkbox({ label, value, hidden, onValueChange, ...props }) {
+	return html`
+		<label className="Checkbox" style=${hidden ? {'display': 'none'} : {}} ...${(props.title ? { 'title': props.title } : {})}>
+			<input
+				type="checkbox"
+				checked=${value}
+				onChange=${({ target }) => onValueChange(target.checked)}
+				...${props}/>
+			${label}
+		</label>`;
+}
+
+function CollapsibleGroup({ label, stateLabel, menu, expanded, children }) {
+	const contentArea = useRef(null);
+	const menuRef = useRef(null);
+	const [isCollapsed, setIsCollapsed] = usePersistentState(`(${stateLabel ? stateLabel : label}).isCollapsed`, !expanded);
+	const [contentHeight, setContentHeight] = useState(isCollapsed ? 0 : '');
+	const [isMenuVisible, setIsMenuVisible] = useState(false);
+
+	useEffect(() => {
+		setContentHeight(contentArea.current.scrollHeight);
+		const observer = new SVResizeObserver(() => {
+			setContentHeight(contentArea.current.scrollHeight);
+		});
+		observer.observe(contentArea.current);
+		return () => observer.disconnect();
+	}, []);
+
+	useEffect(() => {
+		setContentHeight(contentArea.current.scrollHeight);
+	}, [isCollapsed]);
+
+	if (menu) {
+		// Close the menu when clicking outside of it
+		useEffect(() => {
+			const handleClickOutside = (e) => {
+				if (!isMenuVisible)
+					return;
+				if (menuRef.current && !menuRef.current.contains(e.target)) {
+					setTimeout(() => {
+						setIsMenuVisible(false);
+					}, 150);
+				}
+			}
+			document.addEventListener('mousedown', handleClickOutside);
+			return () => document.removeEventListener('mousedown', handleClickOutside);
+		}, [isMenuVisible]);
+	}
+
+	const expandSvg = html`<${SVG_ArrowDown}/>`;
+	const collapseSvg = html`<${SVG_ArrowUp}/>`;
+
+	return html`
+		<div className="collapsible-group" style=${{'position': 'relative'}}>
+			<div className="collapsible-header" onClick=${() => setIsCollapsed(!isCollapsed)}>
+				${isCollapsed ? expandSvg : collapseSvg}
+				${label}
+				<div class="flex-separator"></div>
+				${menu && html`
+					<button style=${{ 'padding': '0px 7px'}} onClick=${(e) => (setIsMenuVisible(!isMenuVisible), e.stopPropagation())}>
+						⋮
+					</button>
+					${isMenuVisible && html`
+						<div ref=${menuRef} className="floating-menu" onClick=${(e) => e.stopPropagation()}>
+							${menu}
+						</div>`}
+					`}
+			</div>
+			<div
+				ref=${contentArea}
+				className="collapsible-content ${isCollapsed ? 'collapsed' : 'expanded'}"
+				style=${{ 'max-height': isCollapsed ? 0 : contentHeight }}>
+				${children}
+			</div>
+		</div>`;
+}
+
+function Sessions({ sessionStorage, disabled }) {
+	const [version, setVersion] = useState(0);
+	const [newSessionName, setNewSessionName] = useState('');
+	const [renameSessionName, setRenameSessionName] = useState('');
+	const [renamingId, setRenamingId] = useState(undefined);
+	const [isCreating, setIsCreating] = useState(false);
+
+	useEffect(() => {
+		const incrementVersion = () => setVersion(v => v + 1);
+		sessionStorage.addEventListener('change', incrementVersion);
+		return () => sessionStorage.removeEventListener('change', incrementVersion);
+	}, []);
+
+	const switchSession = async (sessionId) => {
+		if (sessionStorage.selectedSession != sessionId) {
+			await sessionStorage.switchSession(sessionId);
+		}
+	};
+
+	const startRenameSession = (sessionId, name) => {
+		setRenameSessionName(name);
+		setRenamingId(sessionId);
+	};
+
+	const renameSession = async (sessionId) => {
+		if (renameSessionName) {
+			await sessionStorage.renameSession(sessionId, renameSessionName);
+			setRenamingId(undefined);
+		}
+	};
+
+	const deleteSession = async (sessionId) => {
+		await sessionStorage.deleteSession(sessionId);
+	};
+
+	const startCreateSession = () => {
+		setNewSessionName(`MikuPad #${sessionStorage.nextId + 1}`);
+		setIsCreating(true);
+	};
+
+	const createSession = async () => {
+		if (newSessionName) {
+			const newId = await sessionStorage.createSession(newSessionName);
+			await sessionStorage.switchSession(newId);
+			setIsCreating(false);
+		}
+	};
+
+	const importSession = () => {
+		const fileInput = document.createElement("input");
+		fileInput.type = 'file';
+		fileInput.multiple = true;
+		fileInput.style.display = 'none';
+		fileInput.onchange = async (e) => {
+			const files = e.target.files;
+			if (files.length === 0)
+				return;
+
+				const sortedFiles = Array.from(files).sort((a, b) => a.lastModified - b.lastModified);
+
+				const reader = new FileReader();
+				let lastNewId = null;
+
+				for (const file of sortedFiles) {
+					await new Promise((resolve, reject) => {
+						reader.onload = async (e) => {
+							lastNewId = await sessionStorage.createSessionFromObject(JSON.parse(e.target.result), false);
+							resolve();
+						};
+						reader.onerror = (e) => {
+							reject(e);
+						};
+						reader.readAsText(file);
+					});
+			}
+			if (lastNewId !== null) {
+				await sessionStorage.switchSession(lastNewId);
+			}
+		};
+		document.body.appendChild(fileInput);
+		fileInput.click();
+		document.body.removeChild(fileInput);
+	};
+
+	const exportSession = () => {
+		const sessionObj = { ...sessionStorage.sessions[sessionStorage.selectedSession] };
+		for (const [key, value] of Object.entries(sessionObj)) {
+			// This is done for compatibility with localStorage export files.
+			sessionObj[key] = JSON.stringify(value);
+		}
+		exportText(`${sessionStorage.getProperty('name')}.json`, JSON.stringify(sessionObj));
+	};
+
+	const cloneSession = async () => {
+		const sessionObj = { ...sessionStorage.sessions[sessionStorage.selectedSession] };
+		for (const [key, value] of Object.entries(sessionObj)) {
+			// This is done for compatibility with localStorage export files.
+			sessionObj[key] = JSON.stringify(value);
+		}
+		const newId = await sessionStorage.createSessionFromObject(sessionObj, true);
+		await sessionStorage.switchSession(newId);
+	};
+
+	function handleKeyDown(sessionId, key) {
+		if (event.key === 'Enter') {
+			if (isCreating)
+				createSession();
+			else if (renamingId !== undefined)
+				renameSession(sessionId);
+		} else if (event.key === 'Escape') {
+			if (isCreating)
+				setIsCreating(false);
+			else if (renamingId !== undefined)
+				setRenamingId(undefined);
+		}
+	}
+
+	return html`
+		<div className="Sessions ${disabled ? 'disabled' : ''}">
+			<ul>
+				${isCreating && html`
+					<li key=-1>
+						<a className="Session">
+							<input
+								type="text"
+								value=${newSessionName}
+								onChange=${(e) => setNewSessionName(e.target.value)}
+								onKeyDown=${(e) => handleKeyDown(undefined, e.key)}
+								onClick=${(e) => e.stopPropagation()}
+								autoFocus
+							/>
+							<div className="flex-separator"></div>
+							<button onClick=${(e) => (createSession(), e.stopPropagation())}><${SVG_Confirm}/></button>
+							<button onClick=${(e) => (setIsCreating(false), e.stopPropagation())}><${SVG_Cancel}/></button>
+						</a>
+					</li>
+				`}
+				${Object.entries(sessionStorage.sessions).reverse().map(([sessionId, session]) => html`
+					<li key=${sessionId}>
+						<a className="Session ${sessionStorage.selectedSession == sessionId ? 'selected' : ''}"
+							onClick=${() => switchSession(+sessionId)}>
+							${renamingId == sessionId ? html`
+								<input
+									type="text"
+									value=${renameSessionName}
+									onChange=${(e) => setRenameSessionName(e.target.value)}
+									onKeyDown=${(e) => handleKeyDown(+sessionId, e.key)}
+									onClick=${(e) => e.stopPropagation()}
+									autoFocus
+								/>
+								<div className="flex-separator"></div>
+								<button onClick=${(e) => (renameSession(+sessionId), e.stopPropagation())}><${SVG_Confirm}/></button>
+								<button onClick=${(e) => (setRenamingId(undefined), e.stopPropagation())}><${SVG_Cancel}/></button>
+							` : html`
+								${session.name}
+								<div className="flex-separator"></div>
+								<button
+									onClick=${(e) => (startRenameSession(+sessionId, session.name), e.stopPropagation())}>
+									<${SVG_Rename}/>
+								</button>
+								<button
+									onClick=${(e) => (deleteSession(+sessionId), e.stopPropagation())}>
+									<${SVG_Trash}/>
+								</button>
+							`}
+						</a>
+					</li>
+				`)}
+			</ul>
+			<div className="vbox">
+				<button disabled=${disabled} onClick=${startCreateSession}>Create</button>
+				<button disabled=${disabled} onClick=${importSession}>Import</button>
+				<button disabled=${disabled} onClick=${exportSession}>Export</button>
+				<button disabled=${disabled} onClick=${cloneSession}>Clone</button>
+			</div>
+		</div>`;
+}
+
+function EditorContextMenu({ isOpen, closeMenu, menuItems, className, ...props }) {
+	const menuRef = useRef(null);
+	const [subMenuOpen, setSubMenuOpen] = useState(null);
+
+	if (className == 'nested') {
+		useEffect(() => {
+			if (menuRef.current) {
+				const rect = menuRef.current.getBoundingClientRect();
+				let newTop = rect.top;
+				let newLeft = rect.left;
+
+				// Check for overflow on the bottom
+				if (rect.bottom > window.innerHeight) {
+					newTop = window.innerHeight - rect.height; // Move menu up
+				}
+
+				// Check for overflow on the right
+				if (rect.right > window.innerWidth) {
+					newLeft = window.innerWidth - rect.width; // Move menu to the left
+				}
+
+				newTop = -4 + newTop - rect.top;
+				newLeft = 210 + newLeft - rect.left;
+
+				// Apply corrected positions
+				menuRef.current.style.top = `${newTop}px`;
+				menuRef.current.style.left = `${newLeft}px`;
+			}
+		}, [isOpen]);
+	} else {
+		let prevCloseMenu = closeMenu;
+		closeMenu = () => { setSubMenuOpen(null); prevCloseMenu(); };
+
+		// Close the menu when clicking outside of it
+		useEffect(() => {
+			const handleClickOutside = (e) => {
+				if (!isOpen)
+					return;
+				if (menuRef.current && !menuRef.current.contains(e.target)) {
+					closeMenu();
+				}
+			}
+			document.addEventListener('mousedown', handleClickOutside);
+			return () => document.removeEventListener('mousedown', handleClickOutside);
+		}, [isOpen]);
+
+		useEffect(() => {
+			if (!props.y)
+				return;
+			if (menuRef.current) {
+				const rect = menuRef.current.getBoundingClientRect();
+				let newTop = props.y;
+				let newLeft = props.x;
+
+				// Check for overflow on the bottom
+				if (rect.bottom > window.innerHeight) {
+					newTop = Math.max(newTop - rect.height, 0); // Move menu up
+				}
+
+				// Check for overflow on the right
+				if (rect.right > window.innerWidth) {
+					newLeft = Math.max(newLeft - rect.width, 0); // Move menu to the left
+				}
+
+				// Apply corrected positions
+				menuRef.current.style.top = `${newTop}px`;
+				props.y = newTop;
+				menuRef.current.style.left = `${newLeft}px`;
+				props.x = newLeft;
+			}
+		}, [props.x, props.y]);
+	}
+
+	return html`
+		<div
+			ref=${menuRef}
+			className="EditorContextMenu ${className || ''}"
+			style=${{
+				...(isOpen ? { display: 'block' } : {}),
+                ...(props.y ? { top: props.y + 'px' } : {}),
+                ...(props.x ? { left: props.x + 'px' } : {})
+			}}>
+			<ul>
+				${menuItems.map(
+					(item) => html`
+						<li
+							className="MenuItem ${item.disabled ? 'disabled' : ''} ${item.subItems ? 'hasSubItems' : ''}"
+							onClick=${(event) => {
+								if (item.action && !item.disabled && !item.subItems) {
+									item.action();
+									closeMenu();
+									event.stopPropagation();
+								}
+							}}
+							onMouseEnter=${(event) => {
+								setSubMenuOpen(null);
+								if (item.subItems && !item.disabled) {
+									setSubMenuOpen(item.label);
+								}
+							}}>
+							${item.label}
+							${item.subItems
+								? html`
+									<span className="arrow">→</span>
+									${EditorContextMenu({
+										isOpen: item.label === subMenuOpen,
+										menuItems: item.subItems,
+										closeMenu: closeMenu,
+										className: 'nested',
+									})}`
+								: ''}
+						</li>
+					`
+				)}
+			</ul>
+		</div>
+	`;
+}
+
+const SVG = ({ 
+	stroke="currentColor",
+	fill="currentColor",
+	strokeWidth="0",
+	children,
+	...props
+}) => {
+	return html`
+	<svg
+		xmlns="http://www.w3.org/2000/svg"
+		fill=${fill}
+		stroke=${stroke}
+		strokeWidth=${strokeWidth}
+		...${props}
+	>
+		${children}
+	</svg>
+`};
+const SVG_Close = ({...props}) => {
+	return html`
+	<${SVG}
+		viewBox="-1 -1 10 10">
+		<path d="M 0 1 L 3 4 L 0 7 L 1 8 L 4 5 L 7 8 L 8 7 L 5 4 L 8 1 L 7 0 L 4 3 L 1 0 L 1 0 Z"/>
+	</${SVG}>
+`};
+const SVG_Confirm = ({...props}) => {
+	return html`
+	<${SVG}
+		width="16"
+		height="16"
+		viewBox="0 0 128 128">
+		<circle cx="64" cy="64" r="64" fill="var(--color-dark)"/>
+		<path d="M54.3 97.2 24.8 67.7c-.4-.4-.4-1 0-1.4l8.5-8.5c.4-.4 1-.4 1.4 0L55 78.1l38.2-38.2c.4-.4 1-.4 1.4 0l8.5 8.5c.4.4.4 1 0 1.4L55.7 97.2c-.4.4-1 .4-1.4 0z"/>
+	</${SVG}>
+`};
+const SVG_Cancel = ({...props}) => {
+	return html`
+	<${SVG}
+		width="16"
+		height="16"
+		viewBox="0 0 128 128">
+		<circle cx="64" cy="64" r="64" fill="var(--color-dark)"/>
+		<path d="M100.3 90.4 73.9 64l26.3-26.4c.4-.4.4-1 0-1.4l-8.5-8.5c-.4-.4-1-.4-1.4 0L64 54.1 37.7 27.8c-.4-.4-1-.4-1.4 0l-8.5 8.5c-.4.4-.4 1 0 1.4L54 64 27.7 90.3c-.4.4-.4 1 0 1.4l8.5 8.5c.4.4 1.1.4 1.4 0L64 73.9l26.3 26.3c.4.4 1.1.4 1.5.1l8.5-8.5c.4-.4.4-1 0-1.4z"/>
+	</${SVG}>
+`};
+const SVG_Trash = ({...props}) => {
+	return html`
+	<${SVG}
+		width="16"
+		height="16"
+		viewBox="0 0 490.646 490.646">
+		<path d="m399.179 67.285-74.794.033L324.356 0 166.214.066l.029 67.318-74.802.033.025 62.914h307.739l-.026-63.046zM198.28 32.11l94.03-.041.017 35.262-94.03.041-.017-35.262zM91.465 490.646h307.739V146.359H91.465v344.287zm225.996-297.274h16.028v250.259h-16.028V193.372zm-80.14 0h16.028v250.259h-16.028V193.372zm-80.141 0h16.028v250.259H157.18V193.372z"/>
+	</${SVG}>
+`};
+const SVG_Rename = ({...props}) => {
+	return html`
+	<${SVG}
+		width="16"
+		height="16"
+		viewBox="0 0 512 448">
+		<path style=${{ strokeLinecap: 'round', strokeMiterlimit: 4 }} d="M0 96v256h320v-32H32V128h288V96H0zM416 96v32h64v192h-64v32h96V96h-96z" />
+		<path style=${{ strokeLinecap: 'round', strokeMiterlimit: 4 }} d="M352 636.362h32v384h-32z" transform="matrix(1, 0, 0, 1, 0, -604.3619995117188)" />
+		<path style=${{ strokeLinecap: 'round', strokeMiterlimit: 4 }} transform="matrix(0, 1, -1, 0, 0, -604.3619995117188)" d="M1020.362-448h32v64h-32zM1020.362-352h32v64h-32zM604.362-448h32v64h-32zM604.362-352h32v64h-32zM764.362-288h128v224h-128z" />
+	</${SVG}>
+`};
+const SVG_ArrowUp = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 330 330"
+		width="12"
+		height="12">
+		<path d="M325.606,229.393l-150.004-150C172.79,76.58,168.974,75,164.996,75c-3.979,0-7.794,1.581-10.607,4.394 l-149.996,150c-5.858,5.858-5.858,15.355,0,21.213c5.857,5.857,15.355,5.858,21.213,0l139.39-139.393l139.397,139.393 C307.322,253.536,311.161,255,315,255c3.839,0,7.678-1.464,10.607-4.394C331.464,244.748,331.464,235.251,325.606,229.393z"/>
+	</${SVG}>
+`};
+const SVG_ArrowDown = ({...props}) => {
+	return html`
+	<${SVG_ArrowUp}
+		...${props}
+		style=${{ 'transform':'rotate(180deg)' }}/>
+`};
+const SVG_Settings = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="-1 -5 8 7">
+		<path d="M0 0 3-3C3-4 3-5 5-5L4-4 5-3 6-4C6-2 5-2 4-2L1 1C0 2-1 1 0 0"/>
+	</${SVG}>
+`};
+const SVG_MobileSidebar = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		transform="translate(0, 2)"
+		width="16"
+		height="16"
+		viewBox="0 0 512 512">
+		<path d="M495.9 166.6c3.2 8.7 .5 18.4-6.4 24.6l-43.3 39.4c1.1 8.3 1.7 16.8 1.7 25.4s-.6 17.1-1.7 25.4l43.3 39.4c6.9 6.2 9.6 15.9 6.4 24.6c-4.4 11.9-9.7 23.3-15.8 34.3l-4.7 8.1c-6.6 11-14 21.4-22.1 31.2c-5.9 7.2-15.7 9.6-24.5 6.8l-55.7-17.7c-13.4 10.3-28.2 18.9-44 25.4l-12.5 57.1c-2 9.1-9 16.3-18.2 17.8c-13.8 2.3-28 3.5-42.5 3.5s-28.7-1.2-42.5-3.5c-9.2-1.5-16.2-8.7-18.2-17.8l-12.5-57.1c-15.8-6.5-30.6-15.1-44-25.4L83.1 425.9c-8.8 2.8-18.6 .3-24.5-6.8c-8.1-9.8-15.5-20.2-22.1-31.2l-4.7-8.1c-6.1-11-11.4-22.4-15.8-34.3c-3.2-8.7-.5-18.4 6.4-24.6l43.3-39.4C64.6 273.1 64 264.6 64 256s.6-17.1 1.7-25.4L22.4 191.2c-6.9-6.2-9.6-15.9-6.4-24.6c4.4-11.9 9.7-23.3 15.8-34.3l4.7-8.1c6.6-11 14-21.4 22.1-31.2c5.9-7.2 15.7-9.6 24.5-6.8l55.7 17.7c13.4-10.3 28.2-18.9 44-25.4l12.5-57.1c2-9.1 9-16.3 18.2-17.8C227.3 1.2 241.5 0 256 0s28.7 1.2 42.5 3.5c9.2 1.5 16.2 8.7 18.2 17.8l12.5 57.1c15.8 6.5 30.6 15.1 44 25.4l55.7-17.7c8.8-2.8 18.6-.3 24.5 6.8c8.1 9.8 15.5 20.2 22.1 31.2l4.7 8.1c6.1 11 11.4 22.4 15.8 34.3zM256 336a80 80 0 1 0 0-160 80 80 0 1 0 0 160z"/>
+	</${SVG}>
+`};
+const SVG_ShowKey = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		width="16"
+		height="16"
+		viewBox="0 0 24 24">
+		<path d="M15 12c0 1.654-1.346 3-3 3s-3-1.346-3-3 1.346-3 3-3 3 1.346 3 3zm9-.449s-4.252 8.449-11.985 8.449c-7.18 0-12.015-8.449-12.015-8.449s4.446-7.551 12.015-7.551c7.694 0 11.985 7.551 11.985 7.551zm-7 .449c0-2.757-2.243-5-5-5s-5 2.243-5 5 2.243 5 5 5 5-2.243 5-5z"/>
+	</${SVG}>
+`};
+const SVG_HideKey = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		width="16"
+		height="16"
+		viewBox="0 0 24 24">
+		<path d="M11.885 14.988l3.104-3.098.011.11c0 1.654-1.346 3-3 3l-.115-.012zm8.048-8.032l-3.274 3.268c.212.554.341 1.149.341 1.776 0 2.757-2.243 5-5 5-.631 0-1.229-.13-1.785-.344l-2.377 2.372c1.276.588 2.671.972 4.177.972 7.733 0 11.985-8.449 11.985-8.449s-1.415-2.478-4.067-4.595zm1.431-3.536l-18.619 18.58-1.382-1.422 3.455-3.447c-3.022-2.45-4.818-5.58-4.818-5.58s4.446-7.551 12.015-7.551c1.825 0 3.456.426 4.886 1.075l3.081-3.075 1.382 1.42zm-13.751 10.922l1.519-1.515c-.077-.264-.132-.538-.132-.827 0-1.654 1.346-3 3-3 .291 0 .567.055.833.134l1.518-1.515c-.704-.382-1.496-.619-2.351-.619-2.757 0-5 2.243-5 5 0 .852.235 1.641.613 2.342z"/>
+	</${SVG}>
+`};
+const SVG_SysPrompt = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 -10 10 10">
+		<path d="M 0 -2 L 1 -1 L 5 -5 L 1 -9 L 0 -8 L 3 -5 L 0 -2 M 4 -1 L 10 -1 L 10 -2.4 L 4 -2.4"/>
+	</${SVG}>
+`};
+const SVG_instTemplate = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 -10 5 10">
+		<path d="M 2.5 -6 A 0.75 0.75 90 0 0 3.25 -6.75 A 0.75 0.75 90 0 0 2.5 -7.5 A 0.75 0.75 90 0 0 1.75 -6.75 A 0.75 0.75 90 0 0 2.5 -6 M 1 0 L 4 0 L 4 -1 L 3 -1 L 3 -5 L 1 -5 L 1 -4 L 2 -4 L 2 -1 L 1 -1 Z"/>
+	</${SVG}>
+`};
+const SVG_ChatMode = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 10 10">
+		<path d="M 2 10 L 2 7 Q 0 7 0 5 L 0 2 Q 0 0 2 0 L 8 0 Q 10 0 10 2 Q 10 2 10 3 L 10 5 Q 10 7 8 7 L 6 7 Z"/>
+	</${SVG}>
+`};
+const SVG_CompletionMode = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="2 -1 34 28">
+		<path d="M 3 25 L 3 4 C 9 1 15 2 18 6 C 21 2 27 1 33 4 L 33 25 C 27 22 21 23 18 26 C 15 23 9 22 3 25 Z"/>
+	</${SVG}>
+`};
+const SVG_Regen = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 40.499 40.5"
+		width="12"
+		height="12">
+		<path d="M39.622,21.746l-6.749,6.75c-0.562,0.562-1.326,0.879-2.122,0.879s-1.56-0.316-2.121-0.879l-6.75-6.75		c-1.171-1.171-1.171-3.071,0-4.242c1.171-1.172,3.071-1.172,4.242,0l1.832,1.832C27.486,13.697,22.758,9.25,17,9.25		c-6.064,0-11,4.935-11,11c0,6.064,4.936,11,11,11c1.657,0,3,1.343,3,3s-1.343,3-3,3c-9.373,0-17-7.626-17-17s7.627-17,17-17		c8.936,0,16.266,6.933,16.936,15.698l1.442-1.444c1.172-1.172,3.072-1.172,4.242,0C40.792,18.674,40.792,20.574,39.622,21.746z"/>
+	</${SVG}>
+`};
+const SVG_Undo = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 24 24"
+		width="12"
+		height="12">
+		<path d="M17.026 22.957c10.957-11.421-2.326-20.865-10.384-13.309l2.464 2.352h-9.106v-8.947l2.232 2.229c14.794-13.203 31.51 7.051 14.794 17.675z"/>
+	</${SVG}>
+`};
+const SVG_Redo = ({...props}) => {
+	return html`
+	<${SVG_Undo}
+		...${props}
+		style=${{ 'transform':'scaleX(-1)' }}/>
+`};
+const SVG_SearchAndReplace = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 29.4 35.4"
+		stroke-linecap="round"
+		stroke-width="5">
+		<path fill="none" stroke-linejoin="round" d="M5 9.1a10.6 10.6 0 0 1 9.7-6.6 10.6 10.6 0 0 1 9.8 6.6m0 7.9a10.6 10.6 0 0 1-9.8 6.7A10.6 10.6 0 0 1 5 17"/>
+		<path fill="none" d="m20.4 24.5 3.6 7.1"/>
+		<path stroke="none" d="M3.6 13.2 0 23.2l13.6-6.4-10-3.6m22.2-.2 3.6-10L16 9.3l10 3.6"/>
+	</${SVG}>
+`};
+const SVG_Moveable = ({...props}) => {
+	return html`
+	<${SVG}
+		...${props}
+		viewBox="0 0 11 11">
+		<path d="M 5.5 11 L 7 9 L 6 9 L 6 6 L 9 6 L 9 7 L 11 5.5 L 9 4 L 9 5 L 6 5 L 6 2 L 7 2 L 5.5 0 L 4 2 L 5 2 L 5 5 L 2 5 L 2 4 L 0 5.5 L 2 7 L 2 6 L 5 6 L 5 9 L 4 9 Z"/>
+	</${SVG}>
+`};
+
+function Modal({ isOpen, onClose, title, description, children, ...props }) {
+	if (!isOpen) {
+		return null;
+	}
+
+	useEffect(() => {
+		const onKeyDown = (event) => {
+			if (event.key === 'Escape') {
+				onClose();
+			}
+		};
+		document.addEventListener('keydown', onKeyDown);
+		return () => {
+			document.removeEventListener('keydown', onKeyDown);
+		};
+	}, []);
+
+	return html`
+		<div className="modal-overlay" onClick=${onClose}>
+			<div className="modal-container">
+				<div className="modal" onClick=${(e) => e.stopPropagation()} ...${props}>
+					<div class="modal-title">${title}</div>
+					${ description=="" ? false : html`<div style=${{ whiteSpace: 'pre-line' }} class='modal-desc'>${description}</div>` }
+					<hr/>
+					<div className="modal-content">
+						${children}
+					</div>
+					<button
+					class="button-modal-top"
+					onClick=${onClose}>
+						<${SVG_Close}/>
+					</button>
+				</div>
+			</div>
+		</div>`;
+}
+
+function EditorPreferencesModal({ isOpen, closeModal, children }) {
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Editor Preferences"
+			description=""
+			style=${{ 'max-width': '20em' }}>
+				<div className="vbox">
+					${children}
+				</div>
+		</${Modal}>`;
+}
+
+function MemoryModal({ isOpen, closeModal, memoryTokens, handleMemoryTokensChange, cancel }) {
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Memory"
+			description="This text will be added at the very top of your context.
+			Prefix and suffix will be attached at the beginning or end of your memory respectively. \\n for newlines in pre/suffix.">
+				<div className="hbox">
+					<${InputBox} label="Prefix" type="text" placeholder="[INST]"
+						readOnly=${!!cancel} value=${memoryTokens.prefix} onValueChange=${(value) => handleMemoryTokensChange("prefix", value)}/>
+					<${InputBox} label="Suffix" type="text" placeholder="[/INST]"
+						readOnly=${!!cancel} value=${memoryTokens.suffix} onValueChange=${(value) => handleMemoryTokensChange("suffix", value)}/>
+				</div>
+				<div class="relative">
+					<textarea
+						readOnly=${!!cancel}
+						placeholder="Anything written here will be injected at the head of the prompt. Tokens here DO count towards the Context Limit."
+						defaultValue=${memoryTokens.text}
+						value=${memoryTokens.text}
+						onInput=${(e) => handleMemoryTokensChange("text", e.target.value) }
+						class="expanded-text-area-settings"
+						id="memory-area-settings"/>
+					<div class="token-counter">
+						${memoryTokens.tokens}
+					</div>
+				</div>
+			</${Modal}>`;
+}
+
+function AuthorNoteModal({ isOpen, closeModal, authorNoteTokens, handleauthorNoteTokensChange, authorNoteDepth, setAuthorNoteDepth, cancel }) {
+	const handleAuthorNoteDepthChange = (value) => {
+		setAuthorNoteDepth(!isNaN(+value) && value >= 0 ? value : 0);
+	};
+
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Author's Note"
+			description="This text will be injected N newlines from the bottom of your prompt.
+			Prefix and suffix will be attached at the beginning or end of your author's note respectively. \\n for newlines in pre/suffix.">
+				<div className="hbox">
+					<${InputBox} label="Prefix" type="text" placeholder="[INST]"
+						readOnly=${!!cancel} value=${authorNoteTokens.prefix} onValueChange=${(value) => handleauthorNoteTokensChange("prefix", value)}/>
+					<${InputBox} label="Suffix" type="text" placeholder="[/INST]"
+						readOnly=${!!cancel} value=${authorNoteTokens.suffix} onValueChange=${(value) => handleauthorNoteTokensChange("suffix", value)}/>
+					<${InputBox} label="AN Injection Depth (0-N)" type="number" step="1"
+						readOnly=${!!cancel} value=${authorNoteDepth} onValueChange=${handleAuthorNoteDepthChange}/>
+				</div>
+				<div class="relative">
+					<textarea
+						readOnly=${!!cancel}
+						placeholder="Anything written here will be injected ${authorNoteDepth} newlines from bottom into context."
+						defaultValue=${authorNoteTokens.text}
+						value=${authorNoteTokens.text}
+						onInput=${(e) => handleauthorNoteTokensChange("text", e.target.value) }
+						class="expanded-text-area-settings"
+						id="expanded-an-settings"/>
+					<div class="token-counter">
+						${authorNoteTokens.tokens}
+					</div>
+				</div>
+			</${Modal}>`;
+}
+
+function ContextModal({ isOpen, closeModal, tokens, memoryTokens, authorNoteTokens, handleMemoryTokensChange, finalPromptText, defaultPresets, cancel }) {
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Context"
+			description="This is the prompt being sent to your large language model.">
+			<div id="advancedContextPlaceholders">
+			<table id="contextTokensTable" border="1" frame="void" rules="all">
+				<thead>
+					<tr>
+						<th></th>
+						<th>Memory</th>
+						<th>World Info</th>
+						<th>Author's Note</th>
+						<th>Prompt</th>
+						<th></th>
+						<th>Total</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<th>Tokens</th>
+						<td>${memoryTokens.tokens}</td>
+						<td>${memoryTokens.tokensWI}</td>
+						<td>${authorNoteTokens.tokens}</td>
+						<td>${tokens - authorNoteTokens.tokens - memoryTokens.tokensWI - memoryTokens.tokens}</td>
+						<td></td>
+						<td>${tokens}</td>
+					</tr>
+				</tbody>
+			</table>
+			</div>
+			<${CollapsibleGroup} label="Advanced Context Ordering">
+				<div id="context-order-desc">
+					You can use the following placeholders to order the context according to your needs:<br />
+					<div id="advancedContextPlaceholders">
+						<table border="1" frame="void" rules="all">
+							<thead>
+							<tr>
+								<th></th>
+								<th>Prefix</th>
+								<th>Text</th>
+								<th>Suffix</th>
+							</tr>
+							</thead>
+							<tbody>
+							<tr>
+								<th>Memory</th>
+								<td>{memPrefix}</td>
+								<td>{memText}</td>
+								<td>{memSuffix}</td>
+							</tr>
+							<tr>
+								<th>World Info</th>
+								<td>{wiPrefix}</td>
+								<td>{wiText}</td>
+								<td>{wiSuffix}</td>
+							</tr>
+							<tr>
+								<th>Prompt</th>
+								<td></td>
+								<td>{prompt}</td>
+								<td></td>
+							</tr>
+							</tbody>
+						</table>
+					</div>
+					Any text that is not a placeholder will be added into the context as is.
+				</div>
+				<textarea
+					readOnly=${!!cancel}
+					placeholder=${defaultPresets.memoryTokens.contextOrder}
+					defaultValue=${memoryTokens.contextOrder}
+					value=${memoryTokens.contextOrder}
+					onInput=${(e) => handleMemoryTokensChange("contextOrder", e.target.value)}
+					class="expanded-text-area-settings"
+					id="advanced-context-order-settings"/>
+			</${CollapsibleGroup}>
+			<textarea
+				readOnly=${!!cancel}
+				value=${finalPromptText}
+				class="expanded-text-area-settings"
+				id="context-area-settings" readOnly/>
+		</${Modal}>`;
+}
+
+function WorldInfoModal({ isOpen, closeModal, worldInfo, setWorldInfo, cancel, toggleModal, setSillyTarvernWorldInfoJSON }) {
+	const handleWorldInfoNew = () => {
+		setWorldInfo((prevWorldInfo) => {
+			return {
+				...prevWorldInfo,
+				entries: [ { "displayName":"New Entry","text":"","keys":[], "search":"" },...prevWorldInfo.entries ],
+			};
+		});
+	};
+	const handleWorldInfoMove = (index,move) => {
+		const modEntries = worldInfo.entries;
+		if (index+move < 0 || index+move > modEntries.length-1 ) {
+			return;
+		}
+		modEntries.splice(index+move, 0, modEntries.splice(index, 1)[0]);
+		setWorldInfo((prevWorldInfo) => {
+			return {
+				...prevWorldInfo,
+				entries: [ ...modEntries ],
+			};
+		});
+	};
+	const handleWorldInfoDel = (index) => {
+		if (!window.confirm("Are you sure you want to delete the world info entry #" + (index + 1) + ": "+ worldInfo.entries[index].displayName + "?\nThis action cannot be undone."))
+			return;
+		if (index > -1 && index < worldInfo.entries.length) {
+			setWorldInfo((prevWorldInfo) => {
+				console.warn(`Deleting world info entry #${(index + 1)}:`,prevWorldInfo.entries[index])
+				return {
+					...prevWorldInfo,
+					entries: prevWorldInfo.entries.filter((_, i) => i !== index),
+				};
+			});
+		}
+		else {
+			alert("Index " + index + " out of range!");
+		}
+	};
+	const handleWorldInfoChange = (key,index,value) => {
+		setWorldInfo((prevWorldInfo) => {
+			const updatedEntries = [...prevWorldInfo.entries];
+			const updatedEntry = key == "keys"
+				? { ...updatedEntries[index], [key]: value.split(/(?<!\\), ?/) } //.map(item => item.trim())
+				: { ...updatedEntries[index], [key]: value };
+			updatedEntries[index] = updatedEntry;
+
+			return {
+				...prevWorldInfo,
+				entries: updatedEntries,
+			};
+		});
+	};
+	const handleWorldInfoAffixChange = (key, value) => {
+		setWorldInfo((prevWorldInfo) => ({
+			...prevWorldInfo,
+			[key]: value,
+		}));
+	};
+
+	const handleWorldInfoImport = () => {
+		const inputElement = document.createElement("input");
+		inputElement.type = "file";
+		inputElement.onchange = () => {
+			const file = inputElement.files[0];
+			if (!file)
+				return;
+
+			const reader = new FileReader();
+			
+			reader.onload = (e) => {
+				try {
+					const contents = e.target.result;
+					const json = JSON.parse(contents);
+
+					if (Object.values(worldInfo.entries)?.length) {
+						setSillyTarvernWorldInfoJSON(json);
+						toggleModal("wiImportMode");
+						return;
+					} else {
+						importSillyTavernWorldInfo(json, setWorldInfo, "append");
+					}
+				} catch (e) {
+					alert("The JSON data could not be parsed. Please check that it is valid JSON.");
+					console.error(e);
+				}
+			};
+			reader.readAsText(file);
+		}
+		inputElement.click();
+	};
+
+	const handleWorldInfoExport = () => {
+		const exportedObject = { "entries": {} };
+
+		worldInfo.entries.forEach((entry, entryIndex) => {
+			exportedObject.entries[entryIndex] = {
+				"uid": entryIndex,
+				"key": [...entry.keys],
+				"keysecondary": [],
+				"comment": entry.displayName,
+				"content": entry.text,
+				"constant": false,
+				"vectorized": false,
+				"selective": true,
+				"selectiveLogic": 0,
+				"addMemo": true,
+				"order": 100,
+				"position": 0,
+				"disable": false,
+				"excludeRecursion": false,
+				"preventRecursion": false,
+				"delayUntilRecursion": false,
+				"probability": 100,
+				"useProbability": true,
+				"depth": 4,
+				"group": "",
+				"groupOverride": false,
+				"groupWeight": 100,
+				"scanDepth": entry.search || null,
+				"caseSensitive": null,
+				"matchWholeWords": null,
+				"useGroupScoring": null,
+				"automationId": "",
+				"role": null,
+				"sticky": 0,
+				"cooldown": 0,
+				"delay": 0,
+				"displayIndex": 0
+			};
+		});
+
+		const blob = new Blob([JSON.stringify(exportedObject)], { type: "application/json" });
+		const anchor = document.createElement("a");
+
+		const now = new Date();
+		anchor.download = `MikuPad-WorldInfo-${now.getFullYear()}-${(""+(now.getMonth() + 1)).padStart(2, "0")}-${(""+now.getDate()).padStart(2, "0")}.json`;
+		anchor.href = (window.webkitURL || window.URL).createObjectURL(blob);
+		anchor.dataset.downloadurl = ["application/json", anchor.download, anchor.href].join(":");
+		anchor.click();
+	};
+
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="World Info"
+			description="Additional information that is added when specific keywords are found in context.
+			World info will be added at the top of your memory, in the order specified here.
+
+			Each entry will begin on a newline. Keys will be interpreted as case-insensitive regular expressions. Search Range specifies how many tokens back into the context will be searched for activation keys. Search range 0 to disable an entry.">
+			<div id="modal-wi-global">
+				<button id="button-wi-import" disabled=${!!cancel} onClick=${handleWorldInfoImport}>Import entries</button>
+				<button id="button-wi-export" disabled=${!!cancel} onClick=${handleWorldInfoExport}>Export entries</button>
+				<br/>
+				<${CollapsibleGroup} label="Prefix/Suffix" stateLabel="Prefix/Suffix-WI">
+					The prefix and suffix will be added at the beginning or end of all your active World Info entries respectively.
+					<br />
+					<div className="hbox">
+						<${InputBox} label="Prefix" type="text" placeholder="\\n"
+							readOnly=${!!cancel} value=${worldInfo.prefix} onValueChange=${(value) => handleWorldInfoAffixChange("prefix", value)}/>
+						<${InputBox} label="Suffix" type="text" placeholder="\\n"
+							readOnly=${!!cancel} value=${worldInfo.suffix} onValueChange=${(value) => handleWorldInfoAffixChange("suffix", value)}/>
+					</div>
+				</${CollapsibleGroup}>
+				<button id="button-wi-new" disabled=${!!cancel} onClick=${handleWorldInfoNew}>New Entry</button>
+			</div>
+			<div className="modal-wi-content overflow-container">
+				${!Array.isArray(worldInfo.entries) ? null : worldInfo.entries.map((entry, index) => html`
+					<div class="wi-entry" key=${index}>
+						<div class="wi-entry-controls">
+							<div class="wi-entry-filler" />
+							<div class="wi-entry-name">
+								<${InputBox}
+								label="Entry #${index+1}"
+								type="text"
+								readOnly=${!!cancel}
+								placeholder="Name of this entry"
+								value=${entry.displayName}
+								onValueChange=${(value) => handleWorldInfoChange("displayName",index,value)}
+								/>
+							</div>
+							<div class="wi-entry-buttons">
+								<div class="wi-entry-buttons-container">
+									<button disabled=${!!cancel} onClick=${() => handleWorldInfoMove(index,-1)}>
+										<${SVG_ArrowUp}/>
+									</button>
+									<button disabled=${!!cancel} onClick=${() => handleWorldInfoDel(index)}>
+										✕
+									</button>
+									<button disabled=${!!cancel} onClick=${() => handleWorldInfoMove(index,1)}>
+										<${SVG_ArrowDown}/>
+									</button>
+								</div>
+							</div>
+							<div class="wi-entry-text">
+								<div class="hbox">
+									<${InputBox}
+										label="Comma Separated RegEx Keys"
+										type="text"
+										readOnly=${!!cancel}
+										value=${entry.keys.join(',')}
+										placeholder="Required to activate entry"
+										onValueChange=${(value) => handleWorldInfoChange("keys",index,value)}
+										/>
+									<${InputBox}
+										label="Search Range (0 = disabled)"
+										tooltip="Currently not accurate to the token count, it will be used as an estimate."
+
+										type="text"
+										readOnly=${!!cancel}
+										inputmode="numeric"
+										value=${entry.search}
+										placeholder="2048"
+										onValueChange=${(value) => handleWorldInfoChange("search",index,value)}
+										/>
+								</div>
+								<label class="TextArea">
+									Text
+									<textarea
+										readOnly=${!!cancel}
+										placeholder="Information to be inserted into context when key is found"
+										value=${entry.text ? entry.text : ""}
+										defaultValue=${entry.text ? entry.text : ""}
+										onInput=${(e) => handleWorldInfoChange("text",index, e.target.value)}
+										class="wi-textarea" />
+								</label>
+							</div>
+						</div>
+					</div>`)}
+			</div>
+		</${Modal}>`;
+}
+
+function WorldInfoSelectImportBehaviorModal({ isOpen, closeModal, setWorldInfo, cancel, sillyTarvernWorldInfoJSON }) {
+	const handleImportReplace = () => {
+		importSillyTavernWorldInfo(sillyTarvernWorldInfoJSON, setWorldInfo, "replace");
+		closeModal();
+	};
+
+	const handleImportAppend = () => {
+		importSillyTavernWorldInfo(sillyTarvernWorldInfoJSON, setWorldInfo, "append");
+		closeModal();
+	};
+
+	return html`<${Modal} isOpen=${isOpen} onClose=${closeModal}
+		id="modal-wi-importbehavior"
+		title="There are already world info entries present"
+		description="Would you like to delete them before importing the new ones? Or would you like to add the imported entries alongside the existing ones?" >
+		<div id="modal-wi-global">
+			<button id="button-wi-importbehavior-replace" disabled=${!!cancel} onClick=${handleImportReplace}>Delete and import</button>
+			<button id="button-wi-importbehavior-append" disabled=${!!cancel} onClick=${handleImportAppend}>Append to existing</button>
+		</div>
+	</${Modal}>`;
+}
+
+function LogitBiasModal({ isOpen, closeModal, logitBias, setLogitBias, logitBiasParam, setLogitBiasParam, sessionStorage, endpoint, endpointAPI, endpointAPIKey, isMikupadEndpoint, cancel }) {
+	const [lastBiasError, setLastBiasError] = useState(undefined);
+	const [logitBiasTemp, setLogitBiasTemp] = useState([]);
+	const [logitBiasSorted, setLogitBiasSorted] = useState([]);
+	const [logitBiasInput, setLogitBiasInput] = useState({power:"0",string:""});
+
+	const handleLogitBiasInput = (key,value) => {
+		setLogitBiasInput((prevLogitBiasInput) => {
+			return {
+				...prevLogitBiasInput,
+				[key]: value
+			}
+		});
+	};
+
+	const logitBiasAdd = async (biasPower="",biasString="",origValue="") => {
+		setLastBiasError(undefined);
+		// abort if no input or power is NaN
+		if(!biasString) {
+			return;
+		}
+		if (isNaN(+biasPower) || biasPower == "") { 
+			setLastBiasError("Error: Bias must be a number");
+			return;
+		}
+		biasPower = Number(biasPower);
+
+		const modBias = logitBias.bias;
+
+		// delete entry if power 0 or empty
+		if (biasPower == 0) {	
+			if (!logitBias.bias[biasString]) {
+				setLastBiasError("Error: Bias 0 = no Bias");
+				return;
+			}
+			console.log("delete",biasString);
+			setLogitBias((prevLogitBias) => {
+				delete modBias[biasString];
+				return { 
+					...prevLogitBias,
+					bias: {
+						...modBias
+					}
+				};
+			})
+			return;
+		}
+		// if overwriting the string value of an entry, delete the original one
+		if (origValue && origValue != biasString) {
+			delete modBias[origValue];
+		}
+
+		const ac = new AbortController();
+		try {
+			// if the string is a comma separated list of numbers wrapped in /
+			var tokens;
+			const isTokenIds = biasString.match(/^(?<!\\)\/(\s*\d+\s*,?\s*)+(?<!\\)\/$/g);
+			if ( isTokenIds != null ) {
+				// split by "," and use it as token ids directly
+				tokens = {
+					ids: isTokenIds[0].replaceAll("/","").split(",").map( item => Number(item.trim()) ),
+					str: ""
+				};
+			}
+			// else process like normal
+			else {
+				// KNOWN ISSUE: some models automatically prepend a space to any tokenization 
+				// input. to work around this, I'm prepending the input with a "!==", then 
+				// slicing the output array by the number of tokens of "!==".
+				// This could cause issues when trying to bias a token starting with ? where
+				// ? is any character that forms a single token together with " !==", like 
+				// this: " !==?" I've chosen "!==" because it seems to be a very conserved
+				// token between models.
+				//
+				// Now granted, I have not found any strings where this is actually an issue in 
+				// the tokenizers of the models I use, but this is still a huge hackjob of a 
+				// workaround. If anyone can think of a better solution, please let me know.
+				tokens = await getTokens({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: `!==${biasString}`.replace(/\\n/g,'\n'),
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				if (tokens.length === 0) {
+					setLastBiasError("Error: Tokenizer endpoint unavailable.");
+					return;
+				}
+				const logitBiasWorkaround = await getTokens({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: `!==`,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				// Remove however many tokens !== is tokenized as for the workaround
+				tokens.ids = tokens.ids.slice(logitBiasWorkaround.ids.length);
+				if ( Array.isArray(tokens.str) ) {
+					tokens.str = tokens.str.slice(logitBiasWorkaround.ids.length);
+				}
+			}
+
+			console.log("Biasing tokens [",tokens.ids.join(", "),"]",
+				Array.isArray(tokens.str) ? "'"+tokens.str.join("|")+"'"
+					: "'"+biasString+"'",
+				"by power",biasPower)
+			await setLogitBias((prevLogitBias) => ({
+				...prevLogitBias,
+				bias: {
+					...modBias,
+					[biasString]: { // removed Number() here
+						ids: [ ...tokens.ids ],
+						strings: [ ...tokens.str ],
+						power: biasPower
+					}
+				}
+			}));
+		}
+		catch(e) {
+			if (e.name !== 'AbortError') {
+				reportError(e);
+				const errStr = e.toString();
+				if ((endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP) && errStr.includes("401")) {
+					setLastBiasError("Error: Rejected API Key");
+					setRejectedAPIKey(true);
+				} else if (endpointAPI == API_OPENAI_COMPAT && errStr.includes("429")) {
+					setLastBiasError("Error: Insufficient Quota");
+				} else {
+					setLastBiasError(errStr);
+				}
+			}
+			return;
+		}
+	};
+
+	const clamp = (num, min = -Infinity, max = Infinity) => {
+		return Math.min(Math.max(num, min), max);
+	};
+
+	const llamaCppSetLogitBiasParams = () => {
+		const param = [];
+		// TODO grab multi-token strings here and put them in a separate state variable
+		// for phrase bias
+		Object.keys(logitBias.bias).forEach(entry => {
+			// set banned tokens to false, else divide power by 10 to remain within
+			// reasonable range
+			const power = logitBias.bias[entry].power < -99 ? false : Number(logitBias.bias[entry].power) / 10;
+			param.push( [ Number(logitBias.bias[entry].ids[0]), power ] );
+		});
+		setLogitBiasParam(param);
+	};
+	const koboldCppSetLogitBiasParams = () => {
+		const param = {};
+		Object.keys(logitBias.bias).forEach(entry => {
+			// -100 to 100
+			param[Number(logitBias.bias[entry].ids[0])] = clamp(Number(logitBias.bias[entry].power),-100,100)
+		});
+		setLogitBiasParam(param);
+	};
+	const openaiSetLogitBiasParams = () => {
+		const param = {};
+		Object.keys(logitBias.bias).forEach(entry => {
+			// -100 to 100
+			param[String(logitBias.bias[entry].ids[0])] = Number(clamp(Number(logitBias.bias[entry].power),-100,100).toFixed(1))
+		});
+		setLogitBiasParam(param);
+	};
+
+	useMemo(() => {
+		// set the parameters sent to the model in the format expected by the endpoint
+		switch (endpointAPI) {
+			case API_LLAMA_CPP:
+				llamaCppSetLogitBiasParams();
+				break;
+			case API_KOBOLD_CPP:
+			case API_AI_HORDE:
+				koboldCppSetLogitBiasParams();
+				break;
+			case API_OPENAI_COMPAT:
+				openaiSetLogitBiasParams();
+				break;
+		}
+	}, [logitBias, endpointAPI]);
+
+
+	useEffect(() => {
+		const tempArray = logitBiasSorted.map((string, index) =>  ({
+			value: string,
+			valueBack: string,
+			strings: logitBias.bias[string].strings,
+			tokens: logitBias.bias[string].ids,
+			power: logitBias.bias[string].power
+		}));
+		setLogitBiasTemp({
+			positive: tempArray.filter(item => item.power > 0),
+			negative: tempArray.filter(item => item.power < 0)
+		});
+	},[logitBiasSorted,isOpen]);
+
+
+	const handleBiasTempChange = (posneg, key, index, value) => {
+		setLogitBiasTemp((prevLogitBiasTemp) => {
+			const rest = { ...prevLogitBiasTemp };
+			const updatedTemp = [ ...prevLogitBiasTemp[posneg] ];
+
+			updatedTemp[index] = {
+				...updatedTemp[index],
+				[key]: value,
+			};
+			return {
+				...rest,
+				[posneg]: updatedTemp
+			};
+		});
+	};
+
+	useMemo(() => {
+		const biasListToSort = Object.entries(logitBias.bias);
+		const sortPowerString = (a, b) => {
+			const powerDiff = parseInt(b[1].power) - parseInt(a[1].power);
+			if (powerDiff !== 0) {
+				// If powers are different, sort by power
+				return powerDiff;
+			} else {
+				// If powers are the same, sort alphabetically by string value
+				return a[0].localeCompare(b[0]);
+			}
+		};
+
+		const biasListSorted = biasListToSort.sort(sortPowerString);
+		const resultArray = biasListSorted.map(([key]) => key);
+
+		setLogitBiasSorted(resultArray);
+	}, [logitBias]);
+
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Logit Bias"
+			description="Make certain tokens more or less likely to be generated. Recommended ranges are 100 to -100, with -100 being a total ban of the token.
+			Currently only works on the first token of multi-token phrases/words.
+			You can bias IDs directly in a comma separated list, wrapped in '/'. Example: /382,1449,1802/
+
+			Different models might tokenize words differently. Always Re-Tokenize your biases when switching models by pressing the '+' button again for every entry.">
+			${isOpen 
+				&& html`
+					<div className="hbox-flex logitBiasContainer">
+						<div class="small-inputBox">
+							<${InputBox} label="Bias" className="logitBiasPower-container"
+								type="enumber"  max=100 min=-100 step=1
+								readOnly=${!!cancel}
+								onValueChange=${(value) => { handleLogitBiasInput("power",value)} }
+								value=${logitBiasInput.power} 
+								id="logitBiasPower"/>
+						</div>
+						<${InputBox} label="Token" type="text"
+							tooltip="Currently, only the first token of multi-token strings will be biased."
+							readOnly=${!!cancel}
+							value=${logitBiasInput.string}
+							placeholder="String or /ID,.../"
+							onValueChange=${() => {} }
+							onInput=${(e) => {handleLogitBiasInput("string",e.target.value)} }
+							/>
+						<button disabled=${!!cancel} class="hbox-button" onClick=${() => logitBiasAdd(logitBiasInput.power,logitBiasInput.string)}>
+							+
+						</button>
+					</div>
+					${!!lastBiasError && html`
+						<div style=${{"margin":"8px auto"}} className="error-text">${lastBiasError}</div>`}
+				<hr style=${{"width":"95%","margin":"8px auto"}} />
+				<div class="lb-modal-biasList" >
+					${Object.keys(logitBiasTemp).map((key) => {
+						return html`
+							<div class="overflow-container lb-modal-grid-column" id="lb-modal-${key}">
+								${logitBiasTemp[key].map((bias, index) => {
+									return html`
+										<div class="lb-modal-entry lb-modal-grid-row" key=${index}>
+											<${InputBox} label="Bias" class="lb-modal-power"
+												type="enumber" max=100 min=-100 step=1
+												id="lb-modal-power-${index}"
+												readOnly=${!!cancel}
+												onValueChange=${(value) => {handleBiasTempChange(key,"power", index, value)} }
+												value=${bias.power}/>
+
+											<${InputBox} label="Token" type="text"
+												tooltip="Currently, only the first token of multi-token strings will be biased."
+												readOnly=${!!cancel}
+												value=${bias.value}
+												placeholder="String or /ID,.../"
+												onValueChange=${() => {} }
+												onInput=${(e) => handleBiasTempChange(key,"value", index, e.target.value) }
+												/>
+											<div class="lb-modal-tokenized">
+												${endpointAPI == API_LLAMA_CPP && bias.strings != ""
+													? "["+bias.strings.join("|")+"] "
+													: "["+bias.tokens+"]" } 
+
+											</div>
+											<button
+												disabled=${!!cancel}
+												class="hbox-button lb-modal-button lb-modal-button-add"
+												onClick=${() => logitBiasAdd(bias.power, bias.value, bias.valueBack)}>
+												+
+											</button>
+											<button
+												disabled=${!!cancel}
+												class="hbox-button lb-modal-button lb-modal-button-remove"
+												onClick=${() => logitBiasAdd("0", bias.valueBack, bias.valueBack)}
+												>
+												-
+											</button>
+											<hr/>
+										</div>`})}
+							</div>`})}
+				</div>`}
+			</${Modal}>`;
+}
+
+function InstructTemplatesModal({ isOpen, closeModal, templateStorage, selectedTemplate, setSelectedTemplate, templateList, setTemplateList, templates, templatesImport, setTemplates, cancel }) {
+	const [addDeleteTemplate, setAddDeleteTemplate] = useState(false);
+	const [templateDuplicate, setTemplateDuplicate] = useState(false);
+	const [newTemplateName, setNewTemplateName] = useState(undefined);
+
+	function getArrObjByName(array,name,getIndex=false) {
+		const index = array.findIndex(obj => obj.name === name)
+		if (getIndex)
+			return index
+		return array[index == -1 ? 0 : index];
+	}
+
+	function handleInstructTemplateChange(templateName,key,value,back="") {
+		if (key == "name")
+			setNewTemplateName(value);
+
+		setTemplateList((prevState) => {
+			const newState = [
+				...prevState
+			];
+			const tempIndex = newState.findIndex(obj => obj.name === templateName);
+			const index = tempIndex < 0 ? 0 : tempIndex;
+			if (key == "name") { 
+				newState[index] = {
+					...newState[index],
+					'nameNew': value
+				}
+			} else {
+				newState[index] = {
+					...newState[index],
+					affixes: {
+						...newState[index].affixes,
+						[key]: value
+					}
+				}
+			}
+			return newState;
+		});
+	}
+
+	async function handleInstructTemplateAdd() {
+		await updateTemplateDB()
+		setTemplates((prevState) => {
+			var newState = {
+				...prevState
+			}
+			newState[""] = {
+				"sysPre": "",
+				"sysSuf": "",
+				"instPre": "",
+				"instSuf": "",
+				"fimTemplate": undefined,
+			}
+			return { ...newState }
+		})
+		setAddDeleteTemplate(true)
+	}
+	async function handleInstructTemplateDuplicate() {
+		const index = templateList.findIndex(obj => obj.name === selectedTemplate)
+		const reselectTemplate = templateList[index == -1 ? 0 : index]?.nameNew
+		await updateTemplateDB()
+		await setTemplateDuplicate(reselectTemplate + " (Duplicate)")
+		setTemplates((prevState) => {
+			var newState = {
+				...prevState
+			}
+			newState[reselectTemplate + " (Duplicate)"] = {
+				"sysPre": templates[selectedTemplate]?.sysPre,
+				"sysSuf": templates[selectedTemplate]?.sysSuf,
+				"instPre": templates[selectedTemplate]?.instPre,
+				"instSuf": templates[selectedTemplate]?.instSuf,
+				"fimTemplate": templates[selectedTemplate]?.fimTemplate,
+			}
+			return { ...newState }
+		})
+	}
+
+	async function handleInstructTemplateDelete(name) {
+		if (Object.keys(templates).length < 2)
+			return
+		if (!window.confirm("Are you sure you want to delete this template? This action can't be undone."))
+			return;
+
+		console.warn("Deleting Template",name,":",templates[name])
+		setTemplates((prevState) => {
+			var newState = {
+				...prevState
+			}
+			delete newState[name]
+			return { ...newState }
+		})
+		setAddDeleteTemplate(true)
+	}
+
+	useEffect(() => {
+		const index = templateList.findIndex(obj => obj.name === selectedTemplate)
+		const reselectTemplate = templateList[index == -1 ? 0 : index]?.nameNew
+		const list = []
+		let i = 0;
+		for (const key in templates) {
+			list.push({
+				name: key,
+				nameNew:key,
+				value: key,
+				nameBack: key,
+				affixes: templates[key]
+			})
+		}
+		list.sort((a, b) => {
+			var nameA = a.name.toLowerCase();
+			var nameB = b.name.toLowerCase();
+			return (nameA < nameB) ? -1 : (nameA > nameB) ? 1 : 0;
+		});
+		setTemplateList(list)
+		if (reselectTemplate)
+			setSelectedTemplate(reselectTemplate)
+		if (templateDuplicate) {
+			setSelectedTemplate(templateDuplicate)
+			setTemplateDuplicate(false)
+		}
+	}, [templates,selectedTemplate,templatesImport]);
+
+	useEffect(() => {
+		if (!addDeleteTemplate)
+			return
+		setSelectedTemplate("")
+		setAddDeleteTemplate(false)
+	}, [addDeleteTemplate]);
+
+	const updateTemplateDB = async () => {
+		setNewTemplateName(undefined);
+		setTemplates((prevState) => {
+			var newState = {
+				...prevState
+			}
+			for (let i=0;i<templateList.length;i++) {
+				const template = templateList[i]
+				const name = template.nameNew
+				const nameBack = template.nameBack
+
+				if (name === undefined || nameBack === undefined)
+					continue
+				
+				// if template has been renamed, delete old entry, make sure to reselect 
+				// current entry after
+				if (name != nameBack) {
+					newState[name] = prevState[nameBack]
+					delete newState[nameBack]
+				}
+
+				newState[name] = {
+					"sysPre": template.affixes.sysPre,
+					"sysSuf": template.affixes.sysSuf,
+					"instPre": template.affixes.instPre,
+					"instSuf": template.affixes.instSuf,
+					"fimTemplate": template.affixes.fimTemplate,
+				}
+			}
+			return { ...newState }
+		})
+	}
+	useEffect(() => {
+		updateTemplateDB()
+	}, [isOpen, selectedTemplate]);
+
+	const exportTemplates = () => {
+		exportText(`instruct_templates.json`, JSON.stringify(templates));
+	};
+	const importTemplates = async (importDefaults=false) => {
+		if (importDefaults) {
+			if (!window.confirm("This will add all default templates, and overwrite any changes you made to the default templates. This action cannot be undone. Do you wish to continue?"))
+				return;
+			await templateStorage.saveTemplates(defaultPresets.instructTemplates,true)
+			window.location.reload()
+			// a little dirty, but updateTemplateList isn't cooperating
+			return
+		}
+		const fileInput = document.createElement("input");
+		fileInput.type = 'file';
+		fileInput.style.display = 'none';
+		fileInput.onchange = (e) => {
+			const file = e.target.files[0];
+			if (!file)
+				return;
+			const reader = new FileReader();
+			reader.onload = (e) => {
+				const contents = e.target.result;
+				fileInput.func(contents);
+			}
+			reader.readAsText(file);
+		}
+		fileInput.func = async (text) => {
+			await templateStorage.saveTemplates(JSON.parse(text),true)
+			window.location.reload()
+			// a little dirty, but updateTemplateList isn't cooperating
+		};
+		document.body.appendChild(fileInput);
+		fileInput.click();
+		document.body.removeChild(fileInput);
+	};
+
+	return getArrObjByName(templateList,selectedTemplate) && html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Instruct Templates"
+			description="Use placeholders to insert the selected prompt template formats when sending your prompt to the model.
+			Placeholders are listed below. You can insert newlines with '\\n'.
+			When Chat Mode is active, the 'Instruct Suffix' field of the current template will be added at the end of your prompt, before it is processed by the model. Similarly, the 'Instruct Prefix' field will be added at the end of the model's response.">
+			<div id="advancedContextPlaceholders">
+				<table border="1" frame="void" rules="all">
+					<thead>
+					<tr>
+						<th></th>
+						<th>Prefix</th>
+						<th>Suffix</th>
+					</tr>
+					</thead>
+					<tbody>
+					<tr>
+						<th>System Prompt</th>
+						<td>{sys}</td>
+						<td>{/sys}</td>
+					</tr>
+					<tr>
+						<th>Instructions</th>
+						<td>{inst}</td>
+						<td>{/inst}</td>
+					</tr>
+					</tbody>
+				</table>
+			</div>
+			<hr/>
+			<div class="instructTemplatesImportExport">
+				<button
+					title="Import Instruct Templates"
+					disabled=${!!cancel}
+					onClick=${() => importTemplates()}>
+					Import
+				</button>
+				<button
+					title="Export Instruct Templates"
+					disabled=${!!cancel}
+					onClick=${() => exportTemplates()}>
+					Export
+				</button>
+				<button
+					title="Re-Add Default Instruct Templates"
+					disabled=${!!cancel}
+					onClick=${() => importTemplates(true)}>
+					Re-Add Defaults
+				</button>
+			</div>
+			<div className="buttons instructTemplateSidebar">
+				<${SelectBoxTemplate}
+					id="instructTemplatesModalSelect"
+					label="Instruct Template"
+					disabled=${!!cancel}
+					value=${newTemplateName ?? selectedTemplate}
+					onValueChange=${setSelectedTemplate}
+					options=${templateList}/>
+				<button
+					title="Duplicate Currently Selected Instruct Template"
+					disabled=${!!cancel}
+					class="hbox-button"
+					onClick=${() => handleInstructTemplateDuplicate()}>
+					Duplicate
+				</button>
+				<button
+					title="Add Instruct Template"
+					disabled=${!!cancel}
+					class="hbox-button"
+					onClick=${() => handleInstructTemplateAdd()}>
+					New
+				</button>
+				<button
+					title="Delete Selected Instruct Template"
+					disabled=${!!cancel}
+					class="hbox-button"
+					onClick=${() => handleInstructTemplateDelete(selectedTemplate)}>
+					Delete
+				</button>
+			</div>
+			<hr/>
+			<div class="instructtemplatesmodal-edits">
+				<${InputBox} label="Name"
+						placeholder="Name of This Template"
+						id="instructtemplatesmodal-name"
+						className=""
+						tooltip=""
+						readOnly=${!!cancel}
+						value=${getArrObjByName(templateList,selectedTemplate).nameNew}
+						onInput=${e => handleInstructTemplateChange(selectedTemplate,"name",e.target.value,getArrObjByName(templateList,selectedTemplate).nameBack)}
+						onValueChange=${() => {}}/>
+
+				<div className="hbox">
+					<${InputBox} label="Instruct Prefix {inst}"
+						placeholder="[INST]"
+						className=""
+						tooltip=""
+						readOnly=${!!cancel}
+						value=${getArrObjByName(templateList,selectedTemplate)?.affixes.instPre || ""}
+						onInput=${e => handleInstructTemplateChange(selectedTemplate,"instPre",e.target.value)}
+						onValueChange=${() => {}}/>
+
+					<${InputBox} label="Instruct Suffix {/inst}"
+						placeholder="[/INST]"
+						className=""
+						tooltip=""
+						readOnly=${!!cancel}
+						value=${getArrObjByName(templateList,selectedTemplate)?.affixes.instSuf || ""}
+						onInput=${e => handleInstructTemplateChange(selectedTemplate,"instSuf",e.target.value)}
+						onValueChange=${() => {}}/>
+				</div>
+
+				<div className="hbox">
+					<${InputBox} label="System Prompt Prefix {sys}"
+						placeholder="<<SYS>>\n"
+						className=""
+						tooltip=""
+						readOnly=${!!cancel}
+						value=${getArrObjByName(templateList,selectedTemplate)?.affixes.sysPre || ""}
+						onInput=${e => handleInstructTemplateChange(selectedTemplate,"sysPre",e.target.value)}
+						onValueChange=${() => {}}/>
+
+					<${InputBox} label="System Prompt Suffix {/sys}"
+						placeholder="<</SYS>>\n\n"
+						className=""
+						tooltip=""
+						readOnly=${!!cancel}
+						value=${getArrObjByName(templateList,selectedTemplate)?.affixes.sysSuf || ""}
+						onInput=${e => handleInstructTemplateChange(selectedTemplate,"sysSuf",e.target.value)}
+						onValueChange=${() => {}}/>
+				</div>
+
+				<div className="hbox">
+					<div className="vbox">
+						<${Checkbox} label="Supports Fill-In-The-Middle"
+									value=${getArrObjByName(templateList,selectedTemplate)?.affixes.fimTemplate !== undefined}
+									onValueChange=${(value) => handleInstructTemplateChange(selectedTemplate,"fimTemplate", value ? '' : undefined)}/>
+						${getArrObjByName(templateList,selectedTemplate)?.affixes.fimTemplate !== undefined && html`
+								<${InputBox} label="Fill-In-The-Middle Template"
+									placeholder="[SUFFIX]{suffix}[PREFIX]{prefix}"
+									className=""
+									tooltip=""
+									readOnly=${!!cancel}
+									value=${getArrObjByName(templateList,selectedTemplate)?.affixes.fimTemplate || ""}
+									onInput=${e => handleInstructTemplateChange(selectedTemplate,"fimTemplate",e.target.value)}
+									onValueChange=${() => {}}/>`}
+					</div>
+					<div id="advancedContextPlaceholders">
+						${getArrObjByName(templateList,selectedTemplate)?.affixes.fimTemplate !== undefined
+							? html`
+								<div>Use the <b>{fill}</b> placeholder to seamlessly apply the Fill-In-The-Middle template and start the prediction from that point.</div>
+								<div><b>{prefix}</b> represents the text before the placeholder, and <b>{suffix}</b> represents the text after it.</div>`
+							: html`
+								<div>This template doesn't have a Fill-In-The-Middle template.</div>
+								<div>You can use the <b>{predict}</b> placeholder to start the prediction from that point, but the model won't be aware of the text after the placeholder.</div>`}
+					</div>
+				</div>
+			</div>
+
+
+		</${Modal}>`;
+}
+
+function GrammarModal({ isOpen, closeModal, grammar, setGrammar, endpointAPI, cancel }) {
+	const grammarExample = `# "root" specifies the pattern for the overall output
+root ::= (
+    # it must start with the characters "1. " followed by a sequence
+    # of characters that match the "move" rule, followed by a space, followed
+    # by another move, and then a newline
+    "1. " move " " move "\\n"
+
+    # it's followed by one or more subsequent moves, numbered with one or two digits
+    ([1-9] [0-9]? ". " move " " move "\\n")+
+)
+
+# "move" is an abstract representation, which can be a pawn, nonpawn, or castle.
+# The "[+#]?" denotes the possibility of checking or mate signs after moves
+move ::= (pawn | nonpawn | castle) [+#]?
+
+pawn ::= ...
+nonpawn ::= ...
+castle ::= ...`;
+	const grammarHelpUrl = html`<a href="https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md">llama.cpp/grammars/README.md</a>`;
+
+	const grammarEBNFExample = `root      ::= (commands eol)+
+commands  ::= t | info | nav
+nav       ::= "nav(\\"/" [a-z/]*  "\\")"
+info      ::= "info(" setting ")"
+t         ::= "t(" setting ": " value ")"
+value     ::= color | number | string | boolean
+color     ::= "#" [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+setting   ::= [a-z_ ]+
+string    ::= "\\"" [ \\t!#-\\[\\]-~#x80-#xFF]* "\\""
+number    ::= [0-9]+
+boolean   ::= ("true" | "false")
+eol       ::= "\\n"`;
+	const grammarEBNFHelpUrl = html`<a href="https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form">wiki/Extended_Backus–Naur_form</a>`;
+
+	return html`
+		<${Modal} isOpen=${isOpen} onClose=${closeModal}
+			title="Grammar"
+			description=${html`<div>Grammar is a set of rules to generate predictions. Each rule has a name and defines how to create specific text patterns.</div><br/><div>For more information see: ${endpointAPI == API_OPENAI_COMPAT ? grammarEBNFHelpUrl : grammarHelpUrl}</div>`}>
+			<textarea
+				readOnly=${!!cancel}
+				value=${grammar}
+				placeholder=${endpointAPI == API_OPENAI_COMPAT ? grammarEBNFExample : grammarExample}
+				onInput=${(e) => setGrammar(e.target.value)}
+				class="expanded-text-area-settings"/>
+		</${Modal}>`;
+}
+
+function InstructModal({ isOpen, closeModal, predict, cancel, modalState, templates, selectedTemplate, lastError, ...props }) {
+	const [prompt, setPrompt] = useState("");
+	const [includeContext, setIncludeContext] = useState(true);
+	const [result, setResult] = useState("");
+
+	const finish = (replace) => {
+		modalState.result = {
+			content: result,
+			replace: replace
+		};
+		closeModal();
+	};
+
+	if (cancel) {
+		const prevCloseModel = closeModal;
+		closeModal = () => {
+			cancel();
+			prevCloseModel();
+		};
+	}
+
+	function replacePlaceholders(string,placeholders) {
+		// give placeholders as json object
+		// { "placeholder":"replacement" }
+		return string.replace(/\{[^}]+\}/g, function (placeholder) {
+			return placeholders.hasOwnProperty(placeholder)
+				? placeholders[placeholder]
+				: placeholder;
+		}).replace(/\\n/g, '\n')
+	};
+    const handlePredictInModal = () => {
+		setResult("");
+
+		let [prefix,suffix] = [templates[selectedTemplate]?.instPre || "", templates[selectedTemplate]?.instSuf || ""];
+		if (!(prefix || suffix))
+			return;
+
+		prefix = prefix.replace(/\\n/g,'\n');
+		suffix = suffix.replace(/\\n/g,'\n');
+
+		let instructPrompt =
+			prefix +
+			prompt +
+			suffix;
+
+		instructPrompt = replacePlaceholders(instructPrompt, {
+			'{selectedText}': modalState.selectedText.trim(),
+		});
+
+		if (includeContext) {
+			instructPrompt = 
+				modalState.instructContext + 
+				prefix +
+				"Wait a moment, I want to ask you something." +
+				suffix +
+				"Understood." +
+				instructPrompt;
+		}
+
+		predict(instructPrompt, 1, (chunk) => {
+			setResult((r) => r + chunk.content);
+			return true;
+		});
+    };
+
+	
+	useEffect(() => {
+		function onKeyDown(e) {
+			const { altKey, ctrlKey, shiftKey, key, defaultPrevented } = e;
+			if (defaultPrevented || !isOpen)
+				return;
+			switch (`${altKey}:${ctrlKey}:${shiftKey}:${key}`) {
+				case 'false:false:true:Enter':
+				case 'false:true:false:Enter':
+					handlePredictInModal();
+					break;
+				case 'false:false:false:Escape':
+					cancel();
+					break;
+				default:
+					return;
+			}
+			e.preventDefault();
+		}
+
+		window.addEventListener('keydown', onKeyDown);
+		return () => {
+			window.removeEventListener('keydown', onKeyDown);
+		};
+	}, [predict, cancel]);
+
+    return html`
+        <${Modal} isOpen=${isOpen} onClose=${closeModal}
+            title="Instruct"
+            description="Instruct the language model without directly modifying the existing prompt text.\nYou can incorporate any selected text by using the placeholder '{selectedText}' in your prompt.">
+            ${isOpen && html`
+                <div className="vbox instruct-modal-container">
+                    <textarea
+                        label="Prompt"
+						autoFocus
+						style=${{height: "200px"}}
+                        value=${prompt}
+                        onChange=${(e) => setPrompt(e.target.value)}
+                        placeholder="Enter your prompt here..."
+						className="wi-textarea"
+						readOnly=${!!cancel}/>
+
+					<${Checkbox} label="Include Context"
+						value=${includeContext}
+						onValueChange=${(v) => setIncludeContext(v)}/>
+
+                    <div className="vbox">
+						${!cancel && html`
+							<button
+								onClick=${handlePredictInModal}>
+								Predict
+							</button>`}
+						${cancel && html`
+							<button
+								onClick=${() => cancel()}
+								className=${cancel && !props.sessionEndpointConnecting ? (props.predictStartTokens === props.tokens ? 'processing' : 'completing') : ''}>
+								Cancel
+							</button>`}
+						${!!lastError && html`
+							<span className="error-text">${lastError}</span>`}
+                    </div>
+
+					<textarea
+						label="Result"
+						style=${{height: "200px"}}
+						value=${result}
+						onChange=${(e) => setResult(e.target.value)}
+						readOnly=${!!cancel}
+						className="wi-textarea"/>
+
+					<button
+						onClick=${() => finish(false)}
+						disabled=${!!cancel}>
+						Insert At Cursor
+					</button>
+
+					<button
+						onClick=${() => finish(true)}
+						disabled=${!modalState.selectedText || !!cancel}>
+						Replace Selected
+					</button>
+                </div>
+            `}
+        </${Modal}>
+    `;
+}
+
+function Widget({ isOpen, onClose, title, id, children, ...props }) {
+	if (!isOpen) {
+		return null;
+	}
+
+	const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!isDragging) return;
+      const deltaX = e.clientX - dragRef.current.startX;
+      const deltaY = e.clientY - dragRef.current.startY;
+      setPosition({
+        x: dragRef.current.initialX + deltaX,
+        y: dragRef.current.initialY + deltaY,
+      });
+    };
+
+    const handleMouseUp = () => {
+      setIsDragging(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDragging]);
+
+  const handleMouseDown = (e) => {
+    setIsDragging(true);
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      initialX: position.x,
+      initialY: position.y,
+    };
+  };
+
+	useEffect(() => {
+		const onKeyDown = (event) => {
+			if (event.key === 'Escape') {
+				onClose();
+			}
+		};
+		document.addEventListener('keydown', onKeyDown);
+		return () => {
+			document.removeEventListener('keydown', onKeyDown);
+		};
+	}, []);
+
+	return html`
+		<div className="widget-body"
+			id="${id}"
+			style=${{ transform: `translate(${position.x}px, ${position.y}px)` }}>
+			<div class="widget-container">
+				<div class="widget-title-bar">
+					<div class="widget-title"
+						style=${{ cursor: isDragging ? 'grabbing' : 'grab' }}
+						onMouseDown=${handleMouseDown}
+						onMouseMove=${() => {}}
+						onMouseUp=${() => {}}
+						onMouseLeave=${() => {}}>
+						<${SVG_Moveable}/>
+						${title}
+					</div>
+					<button
+						class="button-widget-top"
+						onClick=${onClose}>
+						<${SVG_Close}/>
+					</button>
+				</div>
+				<div className="widget-content">
+					${children}
+				</div>
+			</div>
+		</div>`;
+}
+function SearchAndReplaceWidget({ isOpen, closeWidget, id, children, promptArea, promptText, cancel, ...props }) {
+	const [searchAndReplaceError, setSearchAndReplaceError] = useState(undefined);
+	const [searchAndReplaceMode, setSearchAndReplaceMode] = usePersistentState('searchAndReplaceMode', 0);
+	const [searchTerm, setSearchTerm] = usePersistentState('searchTerm','');
+	const [searchFlags, setSearchFlags] = usePersistentState('searchFlags','gi');
+	const [replaceTerm, setReplaceTerm] = usePersistentState('replaceTerm','');
+	const [numMatches, setNumMatches] = useState(0);
+	const [inputElement, setInputElement] = useState(null);
+	const [replacedTrigger, setReplacedTrigger] = useState(false);
+	const positions = useRef([]);
+	const [currentIndex, setCurrentIndex] = useState(-1);
+
+	useEffect(() => {
+		if (promptArea.current) {
+			setInputElement(promptArea.current);
+		}
+	}, [promptArea]);
+
+	function handleFindNext(mode,search,flags) {
+		setSearchAndReplaceError(undefined)
+		if (!search)
+			return
+		switch(mode) {
+			case 0:
+				findNextMatch(mode,search,flags,inputElement)
+				break;
+			case 1:
+				findNextMatch(mode,search,flags,inputElement)
+				break;
+			case 2:
+				templateFindNext(search,inputElement)
+				break;
+		}
+	}
+	function handleFindPrev(mode,search,flags) {
+		setSearchAndReplaceError(undefined)
+		if (!search)
+			return
+		switch(mode) {
+			case 0:
+				findPrevMatch(mode,search,flags,inputElement)
+				break;
+			case 1:
+				findPrevMatch(mode,search,flags,inputElement)
+				break;
+			case 2:
+				templateFindPrev(mode,search,inputElement)
+				break;
+		}
+	}
+
+	function findAllMatches(mode, search, flags, elem) {
+		if (!inputElement)
+			return [];
+		setSearchAndReplaceError(undefined)
+		let startIndex = 0;
+		let index;
+		let match;
+		let positions = [];
+		let text = elem.value;
+
+		if (mode == 0) {
+			while ((index = text.indexOf(search, startIndex)) > -1) {
+					positions.push({ start: index, end: index + search.length });
+					startIndex = index + search.length;
+			}
+		}
+		else if (mode == 1) {
+			try {
+				if (flags && !flags.includes("g"))
+					flags += "g" // if no global flag, while loop is infinite
+				else if (flags == "")
+					flags = "g"
+				let re = new RegExp(String.raw`${search}`, String.raw`${flags ?? "g"}`);
+				while ((match = re.exec(text)) !== null) {
+					positions.push({ start: match.index, end: re.lastIndex });
+					if (match.index === re.lastIndex) {
+						re.lastIndex++;
+					}
+				}
+			}
+			catch (e) {
+				reportError(e);
+				const errStr = e.toString();
+				setSearchAndReplaceError(errStr);
+				return [];
+			}
+		}
+		return positions;
+	}
+	function highlightIndex(elem, index) {
+		if (positions.current.length > 0 && index >= 0 && index < positions.current.length) {
+			const position = positions.current[index];
+			elem.focus();
+			elem.scrollTop = 0;
+
+			// Scroll to selection position.
+			const fullText = elem.value;
+			elem.value = fullText.substring(0, position.end);
+			elem.scrollTop = elem.scrollHeight;
+			elem.value = fullText;
+
+			elem.setSelectionRange(position.start, position.end);
+		}
+	}
+	function findNextMatch(mode,search,flags,elem) {
+		if (positions.current.length === 0) {
+			findAndStorePositions(mode,search,flags,elem);
+		}
+		if (positions.current.length > 0) {
+			let index = (currentIndex + 1) % positions.current.length;
+			setCurrentIndex(index);
+			highlightIndex(inputElement, index);
+		}
+	}
+
+	function findPrevMatch(mode,search,flags,elem) {
+		if (positions.current.length === 0) {
+			findAndStorePositions(mode,search,flags,elem);
+		}
+		if (positions.current.length > 0) {
+			let index = (currentIndex - 1 + positions.current.length) % positions.current.length;
+			setCurrentIndex(index);
+			highlightIndex(inputElement, index);
+		}
+	}
+
+	function findAndStorePositions(mode,search,flags,elem) {
+		positions.current = findAllMatches(mode, search, flags, elem);
+		setCurrentIndex(-1); 
+		if (!searchAndReplaceError && positions.current.length === 0)
+			setSearchAndReplaceError(`Warning: No matches found for ${ (mode==0?"Plaintext":mode==1?"RegEx":"Template") } \'${search}\'`)
+	}
+
+	function handleSearchAndReplace(mode,search,flags,replace) {
+		// TODO
+		// Add this to undo/redo
+		setSearchAndReplaceError(undefined)
+		if (!search)
+			return
+		positions.current = findAllMatches(mode, search, flags, inputElement);
+		if (!searchAndReplaceError && positions.current.length === 0) {
+			setSearchAndReplaceError(`Warning: No matches found for ${ (mode==0?"Plaintext":mode==1?"RegEx":"Template") } \'${search}\'`)
+			return
+		}
+		setReplacedTrigger((prev) => !prev)
+
+		switch(mode) {
+			case 0:
+				plaintextReplace(search,replace,inputElement)
+				break;
+			case 1:
+				regexReplace(search,flags,replace,inputElement)
+				break;
+			case 2:
+				templateReplace(search,replace,inputElement)
+				break;
+		}
+	}
+
+	function plaintextReplace(search,replace,elem) {
+		// need to figure out a smart way to keep the cursor position
+		elem.value = elem.value.replaceAll(search,replace)
+		const event = new Event('input', { bubbles: true });
+		elem.dispatchEvent(event);
+	}
+	function regexReplace(search,flags,replace,elem) {
+		try {
+			let re = new RegExp(String.raw`${search}`, String.raw`${flags ?? ""}`);
+			elem.value = elem.value.replace(re,replace)
+			const event = new Event('input', { bubbles: true });
+			elem.dispatchEvent(event);
+		}
+		catch (e) {
+			reportError(e);
+			const errStr = e.toString()
+			setSearchAndReplaceError(errStr)
+		}
+	}
+
+	function countMatches(mode, search, flags) {
+		setSearchAndReplaceError(undefined)
+		if (!searchTerm) {
+			setNumMatches(0)
+			return
+		}
+		positions.current = findAllMatches(mode, search, flags, inputElement);
+		try {
+			setNumMatches(positions.current.length ?? 0)
+		}
+		catch {
+			setNumMatches(0)
+		}
+		if (positions.current.length <= currentIndex) {
+			setCurrentIndex(positions.current.length - 1);
+		}
+	}
+
+	useEffect(() => {
+		countMatches(searchAndReplaceMode,searchTerm,searchFlags)
+	}, [searchAndReplaceMode,searchTerm,searchFlags,isOpen,replacedTrigger,promptText]);
+
+	return html`
+		<${Widget} isOpen=${isOpen} onClose=${closeWidget}
+			title="Search and Replace"
+			id="${id}">
+				${children}
+				<div class="searchAndReplace-inputs">
+					<${SelectBox}
+						label="Mode"
+						value=${searchAndReplaceMode}
+						onValueChange=${setSearchAndReplaceMode}
+						options=${[
+							{ name: 'Plaintext', value: 0 },
+							{ name: 'RegEx', value: 1 },
+							// { name: 'Template', value: 2 },
+						]}/>
+					${searchAndReplaceMode == 0 && html`
+						<${InputBox} label="Search This" type="text"
+							placeholder="Hatsune Miku"
+							value=${searchTerm} onValueChange=${setSearchTerm}/>
+						<${InputBox} label="Replace With" type="text"
+							placeholder="GUMI"
+							readOnly=${!!cancel} value=${replaceTerm} onValueChange=${setReplaceTerm}/>
+					`}
+					${searchAndReplaceMode == 1 && html`
+						<${InputBox} label="Search This RegEx" type="text"
+							placeholder="(\\w+) Miku"
+							value=${searchTerm} onValueChange=${setSearchTerm}/>
+						<div style=${{ 'flex':'0 1 min-content' }}>
+							<${InputBox} label="Flags" type="text"
+								placeholder="gi"
+								value=${searchFlags} onValueChange=${setSearchFlags}/>
+						</div>
+						<${InputBox} label="Replace With" type="text"
+							placeholder="$1 GUMI"
+							value=${replaceTerm} onValueChange=${setReplaceTerm}/>
+					`}
+				</div>
+				<div class="searchAndReplace-buttons">
+					<div class="flexfiller"/>
+					<div class="number-matches">
+						${currentIndex >= 0 ? (currentIndex+1) + " /" : ""} ${ searchTerm != "" ? numMatches + (numMatches == 1 ? " Match" : " Matches") : ""}
+					</div>
+					<button
+						class="findButton"
+						title="Find Previous Match"
+						onClick=${() => handleFindPrev(searchAndReplaceMode,searchTerm,searchFlags)}>
+						<${SVG_ArrowUp}/>
+					</button>
+					<button
+						class="findButton"
+						title="Find Next Match"
+						onClick=${() => handleFindNext(searchAndReplaceMode,searchTerm,searchFlags)}>
+							<${SVG_ArrowDown}/>
+					</button>
+					<button
+						title="Replace All Matches"
+						disabled=${!!cancel}
+						onClick=${() => handleSearchAndReplace(searchAndReplaceMode,searchTerm,searchFlags,replaceTerm)}>
+							Replace All
+					</button>
+				</div>
+				${!!searchAndReplaceError && html`
+					<div style=${{"margin":"8px auto"}} className="error-text">${searchAndReplaceError}</div>`}
+		</${Widget}>`;
+}
+
+class IndexedDBAdapter {
+	constructor() {
+		this.dbName = 'MikuPad';
+	}
+
+	async init() {
+		try {
+			if (!await navigator.storage.persisted()) {
+				const startTime = performance.now();
+				const persistent = await navigator.storage.persist();
+				const elapsedTime = performance.now() - startTime;
+				
+				if (!persistent && !localStorage.getItem('persistentStorageWarningShown')) {
+					// If the response came back in less than 500ms, it was likely an automatic denial
+					// (500ms is generally considered faster than human reaction time)
+					if (elapsedTime < 500) {
+						alert('Your browser has automatically denied persistent storage for Mikupad. Be aware that the browser may clear the database when under storage pressure. You might need to adjust your browser settings to enable this feature, or alternatively, you can use the Mikupad server.');
+					} else {
+						alert('You have chosen not to enable persistent storage for Mikupad. Be aware that the browser may clear the database when under storage pressure. As an optional alternative, you can use the Mikupad server.');
+					}
+					localStorage.setItem('persistentStorageWarningShown', 'true');
+				}
+			}
+		} catch {}
+	}
+
+	async openDatabase() {
+		return new Promise((resolve, reject) => {
+			const openRequest = indexedDB.open(this.dbName, 2);
+
+			openRequest.onerror = () => reject(openRequest.error);
+			openRequest.onsuccess = () => resolve(openRequest.result);
+
+			openRequest.onupgradeneeded = (event) => {
+				const db = event.target.result;
+				for (const storeName of ["Sessions", "Templates"]) {
+					if (!db.objectStoreNames.contains(storeName)) {
+						db.createObjectStore(storeName);
+					}
+				}
+			};
+			openRequest.onblocked = () => console.warn('Request was blocked');
+		});
+	}
+
+	async loadFromDatabase(db, storeName, key) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readonly');
+			const store = tx.objectStore(storeName);
+			const request = store.get(key);
+
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	async loadAllFromDatabase(db, storeName) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readonly');
+			const store = tx.objectStore(storeName);
+			const request = store.openCursor();
+
+			let allTables = {};
+
+			request.onsuccess = async (event) => {
+				const cursor = event.target.result;
+				if (cursor) {
+					allTables[cursor.key] = cursor.value;
+					cursor.continue();
+				} else {
+					resolve(allTables);
+				}
+			};
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	async loadSessionInfoFromDatabase(db, storeName) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readonly');
+			const store = tx.objectStore(storeName);
+			const request = store.openCursor();
+
+			let allTables = {};
+
+			request.onsuccess = async (event) => {
+				const cursor = event.target.result;
+				if (cursor) {
+					if (cursor.key !== 'nextSessionId' && cursor.key !== 'selectedSessionId') {
+						allTables[cursor.key] = cursor.value.name;
+					}
+					cursor.continue();
+				} else {
+					resolve(allTables);
+				}
+			};
+			request.onerror = () => reject(request.error);
+		});
+	}
+	
+
+	async saveToDatabase(db, storeName, key, data) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readwrite');
+			const store = tx.objectStore(storeName);
+			const request = store.put(data, key);
+
+			request.onsuccess = () => resolve();
+			request.onerror = () => reject(request.error);
+		});
+	}
+
+	async renameSessionInDatabase(db, storeName, key, newName) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readwrite');
+			const store = tx.objectStore(storeName);
+			const getRequest = store.get(key);
+
+			getRequest.onsuccess = async () => {
+				const sessionData = getRequest.result;
+				if (sessionData) {
+					sessionData.name = newName;
+					const putRequest = store.put(sessionData, key);
+					putRequest.onsuccess = () => resolve();
+					putRequest.onerror = () => reject(putRequest.error);
+				} else {
+					reject(new Error(`Session with key '${key}' not found`));
+				}
+			};
+			getRequest.onerror = () => reject(request.error);
+		});
+	}
+
+	async deleteFromDatabase(db, storeName, key) {
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(storeName, 'readwrite');
+			const store = tx.objectStore(storeName);
+			const request = store.delete(key);
+
+			request.onsuccess = () => resolve();
+			request.onerror = () => reject(request.error);
+		});
+	}
+}
+
+class ServerDBAdapter {
+	constructor(sessionEndpoint) {
+		this.sessionEndpoint = sessionEndpoint;
+	}
+
+	async init() {
+		const res = await fetch(new URL('/version', this.sessionEndpoint), {
+			method: 'GET',
+			headers: {
+				'Content-Type': 'application/json'
+			}
+		});
+		if (!res.ok)
+			throw new Error("Not a mikupad server or version mismatch.");
+		const { version } = await res.json();
+		if (version !== 2)
+			throw new Error("Mikupad server version mismatch.");
+	}
+
+	async openDatabase() {
+		return async (route, options) => {
+			try {
+				return await fetch(new URL(route, this.sessionEndpoint), {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify(options),
+				});
+			} catch (e) {
+				reportError(e);
+				return { ok: false, status: e.toString() };
+			}
+		};
+	}
+
+	async loadFromDatabase(db, storeName, key) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/load", { storeName, key });
+			if (!res.ok) {
+				if (res.status == 404) {
+					resolve(undefined);
+				} else {
+					reject(res.status);
+				}
+				return;
+			}
+			const { result } = await res.json();
+			resolve(result);
+		});
+	}
+
+	async loadAllFromDatabase(db, storeName) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/all", { storeName });
+			if (!res.ok) {
+				reject(res.status);
+				return;
+			}
+			const { result } = await res.json();
+			resolve(result);
+		});
+	}
+
+	async loadSessionInfoFromDatabase(db, storeName) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/sessions", { storeName });
+			if (!res.ok) {
+				reject(res.status);
+				return;
+			}
+			const { result } = await res.json();
+			resolve(result);
+		});
+	}
+
+	async saveToDatabase(db, storeName, key, data) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/save", { storeName, key, data });
+			if (!res.ok) {
+				reject(res.status);
+				return;
+			}
+			const { result } = await res.json();
+			resolve(result);
+		});
+	}
+
+	async renameSessionInDatabase(db, storeName, key, newName) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/rename", { storeName, key, newName });
+			if (!res.ok) {
+				reject(res.status);
+				return;
+			}
+			const { result } = await res.json();
+			resolve(result);
+		});
+	}
+
+	async deleteFromDatabase(db, storeName, key) {
+		return new Promise(async (resolve, reject) => {
+			const res = await db("/delete", { storeName, key });
+			if (!res.ok) {
+				reject(res.status);
+				return;
+			}
+			resolve();
+		});
+	}
+}
+
+class AbstractStorage extends EventTarget {
+	constructor(storeName, dbAdapter) {
+		super();
+		this.storeName = storeName;
+		this.dbAdapter = dbAdapter;
+		this.saveQueue = [];
+		this.saveTimer = undefined;
+	}
+
+	dispatchChangeEvent() {
+		this.dispatchEvent(new CustomEvent('change'));
+	}
+
+	dispatchErrorEvent(detail) {
+		this.dispatchEvent(new CustomEvent('error', { detail }));
+	}
+
+	startSaveTimer(saveCallback) {
+		this.saveTimer = setInterval(async () => await this.saveTimerHandler(saveCallback), 500);
+	}
+
+	async saveTimerHandler(saveCallback) {
+		const keys = [];
+		while (this.saveQueue.length) {
+			keys.push(this.saveQueue.pop());
+		}
+
+		for (const key of keys) {
+			await saveCallback(key);
+		}
+	}
+
+	enqueueSave(key) {
+		if (!this.saveQueue.includes(key))
+			this.saveQueue.push(key);
+	}
+
+	async openDatabase() {
+		try {
+			return await this.dbAdapter.openDatabase();
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async loadFromDatabase(db, key) {
+		try {
+			return await this.dbAdapter.loadFromDatabase(db, this.storeName, key);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async loadAllFromDatabase(db) {
+		try {
+			return await this.dbAdapter.loadAllFromDatabase(db, this.storeName);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async loadSessionInfoFromDatabase(db) {
+		try {
+			return await this.dbAdapter.loadSessionInfoFromDatabase(db, this.storeName);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async saveToDatabase(db, key, data) {
+		try {
+			return await this.dbAdapter.saveToDatabase(db, this.storeName, key, data);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async renameSessionInDatabase(db, key, newName) {
+		try {
+			return await this.dbAdapter.renameSessionInDatabase(db, this.storeName, key, newName);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+
+	async deleteFromDatabase(db, key) {
+		try {
+			return await this.dbAdapter.deleteFromDatabase(db, this.storeName, key);
+		} catch (e) {
+			this.dispatchErrorEvent(e);
+			throw e;
+		}
+	}
+}
+
+class TemplateStorage extends AbstractStorage {
+	constructor(dbAdapter) {
+		super('Templates', dbAdapter);
+		this.templates = {};
+	}
+
+	async init() {
+		const db = await this.openDatabase();
+		await this.loadTemplates(db);
+	}
+
+	async saveTemplates(newTemplates,writeOnly=false) {
+		const db = await this.openDatabase();
+
+		// Check if the keys exists in input, if not, delete
+		for (const key of Object.keys(this.templates)) {
+			if (Object.keys(newTemplates).includes(key))
+				continue;
+			if (writeOnly)
+				continue;
+			try {
+				// If the key not in input, delete it
+				await this.deleteFromDatabase(db, key);
+				console.warn('Deleted key:', key);
+			} catch {
+				console.error('Error deleting key:', key);
+			}
+		}
+
+		// put input keys
+		for (const [key, value] of Object.entries(newTemplates)) {
+			if (JSON.stringify(value) === JSON.stringify(this.templates[key]))
+				continue;
+			await this.saveToDatabase(db, key, value);
+		}
+
+		this.templates = newTemplates;
+	}
+
+	async loadTemplates(db) {
+		this.templates = await this.loadAllFromDatabase(db);
+	}
+}
+
+class SessionStorage extends AbstractStorage {
+	constructor(dbAdapter) {
+		super('Sessions', dbAdapter);
+		this.nextId = undefined;
+		this.sessions = {};
+		this.selectedSession = undefined;
+
+		if (dbAdapter.sessionEndpoint) {
+			this.sessionEndpoint = dbAdapter.sessionEndpoint;
+			this.proxyEndpoint = `${dbAdapter.sessionEndpoint}/proxy`;
+		}
+	}
+
+	dispatchSessionChangeEvent() {
+		this.dispatchEvent(new CustomEvent('sessionchange'));
+	}
+
+	async init() {
+		const db = await this.openDatabase();
+		this.nextId = (await this.loadFromDatabase(db, 'nextSessionId')) || 0;
+		this.selectedSession = (await this.loadFromDatabase(db, 'selectedSessionId')) || 0;
+		await this.loadSessions(db);
+		this.startSaveTimer(async (sessionId) => await this.saveSessionToDB(sessionId));
+	}
+
+	async saveSessionToDB(sessionId) {
+		const sessionData = this.sessions[sessionId];
+		if (!sessionData || sessionData.inactive)
+			return;
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, sessionId, sessionData);
+	}
+
+	async getNewId() {
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, 'nextSessionId', this.nextId + 1);
+		this.nextId += 1;
+		return this.nextId - 1;
+	}
+
+	// We leave the localStorage content untouched for now,
+	// but we might want to erase it in the future.
+	async migrateSessions() {
+		const nextId = +localStorage.getItem('nextSessionId');
+		if (nextId == 0)
+			return false;
+		this.nextId = nextId;
+		this.selectedSession = +localStorage.getItem('selectedSessionId');
+		for (const key of Object.keys(localStorage)) {
+			const [sessionId, propertyName] = key.split('/');
+			if (propertyName === undefined) continue;
+			let value = localStorage.getItem(key);
+			try {
+				value = JSON.parse(value);
+			} catch {
+				// This might have been added to the localStorage by a extension rather than us. Let's just skip it.
+				continue;
+			}
+			if (value !== null) {
+				this.sessions[sessionId] = this.sessions[sessionId] || {};
+				this.sessions[sessionId][propertyName] = value;
+			}
+		};
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, 'nextSessionId', this.nextId);
+		await this.saveToDatabase(db, 'selectedSessionId', this.selectedSession);
+		for (const sessionId of Object.keys(this.sessions)) {
+			await this.saveToDatabase(db, +sessionId, this.sessions[sessionId]);
+		}
+		return true;
+	}
+
+	async loadSessions(db) {
+		const sessions = await this.loadSessionInfoFromDatabase(db);
+		for (const [key, name] of Object.entries(sessions)) {
+			this.sessions[key] = { name: name };
+		}
+		if (Object.keys(this.sessions).length === 0) {
+			if (!await this.migrateSessions()) {
+				await this.createSession('MikuPad #1');
+			}
+		}
+		await this.switchSession(this.selectedSession);
+	}
+
+	getProperty(propertyName) {
+		return this.sessions[this.selectedSession]?.[propertyName];
+	}
+
+	setProperty(propertyName, value) {
+		if (!this.sessions[this.selectedSession])
+			return;
+		this.sessions[this.selectedSession][propertyName] = value;
+		this.enqueueSave(this.selectedSession);
+	}
+
+	async switchSession(sessionId) {
+		if (!this.sessions[sessionId])
+			return;
+
+		// Flush saveQueue.
+		// TODO: Remove saveQueue, only one session actually needs to be saved at a time.
+		await this.saveTimerHandler(async (sessionId) => await this.saveSessionToDB(sessionId));
+
+		//Clear data of old session in order to minimize memory usage.
+		if (this.sessions[this.selectedSession] && this.sessions[this.selectedSession]['name'])
+			this.sessions[this.selectedSession] = { name: this.sessions[this.selectedSession]['name'], inactive: true };
+
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, 'selectedSessionId', +sessionId);
+
+		this.selectedSession = +sessionId;
+		this.sessions[this.selectedSession] = (await this.loadFromDatabase(db, this.selectedSession));
+
+		this.dispatchChangeEvent();
+		this.dispatchSessionChangeEvent();
+	}
+
+	async renameSession(sessionId, renameSessionName) {
+		this.sessions[sessionId]['name'] = renameSessionName;
+
+		const db = await this.openDatabase();
+		await this.renameSessionInDatabase(db, sessionId, renameSessionName);
+
+		this.dispatchChangeEvent();
+	}
+
+	async deleteSession(sessionId) {
+		if (Object.keys(this.sessions).length === 1)
+			return;
+		if (!window.confirm("Are you sure you want to delete this session? This action can't be undone."))
+			return;
+
+		const db = await this.openDatabase();
+		await this.deleteFromDatabase(db, sessionId);
+
+		// Select another session if the current was deleted
+		if (sessionId == this.selectedSession) {
+			const sessionIds = Object.keys(this.sessions).map(x => +x);
+			const sessionIdx = sessionIds.indexOf(sessionId);
+			const newSessionId = sessionIds[sessionIdx - 1] ?? sessionIds[sessionIdx + 1];
+			await this.switchSession(+newSessionId)
+		}
+
+		delete this.sessions[sessionId];
+		this.dispatchChangeEvent();
+	}
+
+	async createSession(newSessionName) {
+		const newId = await this.getNewId();
+		this.sessions[newId] = { name: newSessionName };
+		
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, newId, this.sessions[newId]);
+
+		onchange?.();
+		return newId;
+	}
+
+	async createSessionFromObject(obj, cloned) {
+		const newId = await this.getNewId();
+		this.sessions[newId] = {};
+
+		for (const [propertyName, value] of Object.entries(obj)) {
+			if (propertyName === 'darkMode') continue;
+			this.sessions[newId][propertyName] = JSON.parse(value);
+		}
+
+		if (!this.sessions[newId].hasOwnProperty('name')) {
+			this.sessions[newId]['name'] = `MikuPad #${this.nextId + 1}`;
+		}
+
+		if (cloned && !this.sessions[newId]['name'].startsWith('Cloned')) {
+			this.sessions[newId]['name'] = `Cloned ${this.sessions[newId]['name']}`;
+		}
+
+		const db = await this.openDatabase();
+		await this.saveToDatabase(db, newId, this.sessions[newId]);
+
+		//Clear data of the session in order to minimize memory usage.
+		if (this.sessions[newId] && this.sessions[newId]['name'])
+			this.sessions[newId] = { name: this.sessions[newId]['name'] };
+
+		onchange?.();
+		return newId;
+	}
+}
+
+const defaultPrompt = `[INST] <<SYS>>
+You are a talented writing assistant. Always respond by incorporating the instructions into expertly written prose that is highly detailed, evocative, vivid and engaging.
+<</SYS>>
+
+Write a story about Hatsune Miku and Kagamine Rin. [/INST]  Sure, how about this:
+
+Chapter 1
+`;
+
+const defaultPresets = {
+	endpoint: 'http://127.0.0.1:8080',
+	endpointAPI: 0,
+	endpointAPIKey: '',
+	endpointModel: '',
+	prompt: [{ type: 'user', content: defaultPrompt }],
+	seed: -1,
+	maxPredictTokens: -1,
+	temperature: 0.7,
+	dynaTempRange: 0,
+	dynaTempExp: 1,
+	repeatPenalty: 1.1,
+	repeatLastN: 256,
+	penalizeNl: false,
+	presencePenalty: 0,
+	frequencyPenalty: 0,
+	topK: 40,
+	topP: 0.95,
+	typicalP: 1,
+	minP: 0,
+	tfsZ: 1,
+	mirostat: 0,
+	mirostatTau: 5.0,
+	mirostatEta: 0.1,
+	xtcThreshold: 0.1,
+	xtcProbability: 0,
+	dryMultiplier: 0,
+	dryBase: 1.75,
+	dryAllowedLength: 2,
+	dryPenaltyRange: 1024,
+	drySequenceBreakers: "[\"\\n\", \":\", \"\\\"\", \"*\"]",
+	bannedTokens: "[]",
+	stoppingStrings: "[]",
+	ignoreEos: false,
+	openaiPresets: false,
+	contextLength: 8192,
+	tokenRatio: 3.3,
+	memoryTokens: ({ "contextOrder":"{memPrefix}{wiPrefix}{wiText}{wiSuffix}{memText}{memSuffix}{prompt}","prefix":"", "text":"", "suffix":""}),
+	authorNoteTokens: ({ "prefix":"", "text":"", "suffix":""}),
+	authorNoteDepth: 3,
+	worldInfo:({
+		"mikuPediaVersion": 1,
+		"entries": [],
+		"prefix": "",
+		"suffix": ""
+	}),
+	logitBias:{ bias:{},model:"none" },
+	instructTemplates:{
+		'Alpaca': {
+			'sysPre' : '### System:\\n',
+			'sysSuf' : '',
+			'instPre': '\\n\\n### Instruction:\\n',
+			'instSuf': '\\n\\n### Response:',
+		},
+		'Mistral': {
+			'sysPre' : '<<SYS>>\\n',
+			'sysSuf' : '<</SYS>>\\n\\n',
+			'instPre': '</s>[INST]',
+			'instSuf': '[/INST]',
+		},
+		'Codestral': {
+			'sysPre' : '<<SYS>>\\n',
+			'sysSuf' : '<</SYS>>\\n\\n',
+			'instPre': '</s>[INST]',
+			'instSuf': '[/INST]',
+			'fimTemplate': '[SUFFIX]{suffix}[PREFIX]{prefix}'
+		},
+		'ChatML': {
+			'sysPre' : '<|im_start|>system\\n',
+			'sysSuf' : '',
+			'instPre': '<|im_end|>\\n<|im_start|>user\\n',
+			'instSuf': '<|im_end|>\\n<|im_start|>assistant\\n',
+		},
+		'Llama 3': {
+			'sysPre' : '<|start_header_id|>system<|end_header_id|>\\n\\n',
+			'sysSuf' : '',
+			'instPre': '<|eot_id|><|start_header_id|>user<|end_header_id|>\\n\\n',
+			'instSuf': '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\\n\\n',
+		},
+		'Phi 2': {
+			'sysPre' : '',
+			'sysSuf' : '',
+			'instPre': '\\nInstruct: ',
+			'instSuf': '\\nOutput: ',
+		},
+		'Phi 3': {
+			'sysPre' : '<|system|>\\n',
+			'sysSuf' : '',
+			'instPre': '<|end|>\\n<|user|>\\n',
+			'instSuf': '<|end|>\\n<|assistant|>\\n',
+		},
+		'Command-R': {
+			'sysPre' : '<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>',
+			'sysSuf' : '',
+			'instPre': '<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>',
+			'instSuf': '<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>',
+		},
+		'Metharme': {
+			'sysPre' : '<|system|>',
+			'sysSuf' : '',
+			'instPre': '<|user|>',
+			'instSuf': '<|model|>',
+		},
+		'Vicuna': {
+			'sysPre' : '',
+			'sysSuf' : '\\n\\n',
+			'instPre': '</s>\\nUSER: ',
+			'instSuf': '\\nASSISTANT: ',
+		},
+		'Gemma': {
+			'sysPre' : '',
+			'sysSuf' : '',
+			'instPre': '<end_of_turn>\\n<start_of_turn>user\\n',
+			'instSuf': '<end_of_turn>\\n<start_of_turn>model\\n',
+		},
+	},
+	scrollTop: 0,
+	enabledSamplers: ['temperature', 'rep_pen', 'pres_pen', 'freq_pen', 'mirostat', 'top_k', 'top_p', 'min_p'],
+	grammar: '',
+	chatAPI: false,
+	tokenStreaming: true,
+	promptPreview: false,
+	promptPreviewTokens: 20,
+};
+
+function joinPrompt(prompt) {
+	return prompt.map(p => p.content).join('');
+}
+
+function replaceUnprintableBytes(inputString) {
+	// Define a regular expression to match unprintable bytes
+	const unprintableBytesRegex = /[\0-\x1F\x7F-\x9F\xAD\u0378\u0379\u037F-\u0383\u038B\u038D\u03A2\u0528-\u0530\u0557\u0558\u0560\u0588\u058B-\u058E\u0590\u05C8-\u05CF\u05EB-\u05EF\u05F5-\u0605\u061C\u061D\u06DD\u070E\u070F\u074B\u074C\u07B2-\u07BF\u07FB-\u07FF\u082E\u082F\u083F\u085C\u085D\u085F-\u089F\u08A1\u08AD-\u08E3\u08FF\u0978\u0980\u0984\u098D\u098E\u0991\u0992\u09A9\u09B1\u09B3-\u09B5\u09BA\u09BB\u09C5\u09C6\u09C9\u09CA\u09CF-\u09D6\u09D8-\u09DB\u09DE\u09E4\u09E5\u09FC-\u0A00\u0A04\u0A0B-\u0A0E\u0A11\u0A12\u0A29\u0A31\u0A34\u0A37\u0A3A\u0A3B\u0A3D\u0A43-\u0A46\u0A49\u0A4A\u0A4E-\u0A50\u0A52-\u0A58\u0A5D\u0A5F-\u0A65\u0A76-\u0A80\u0A84\u0A8E\u0A92\u0AA9\u0AB1\u0AB4\u0ABA\u0ABB\u0AC6\u0ACA\u0ACE\u0ACF\u0AD1-\u0ADF\u0AE4\u0AE5\u0AF2-\u0B00\u0B04\u0B0D\u0B0E\u0B11\u0B12\u0B29\u0B31\u0B34\u0B3A\u0B3B\u0B45\u0B46\u0B49\u0B4A\u0B4E-\u0B55\u0B58-\u0B5B\u0B5E\u0B64\u0B65\u0B78-\u0B81\u0B84\u0B8B-\u0B8D\u0B91\u0B96-\u0B98\u0B9B\u0B9D\u0BA0-\u0BA2\u0BA5-\u0BA7\u0BAB-\u0BAD\u0BBA-\u0BBD\u0BC3-\u0BC5\u0BC9\u0BCE\u0BCF\u0BD1-\u0BD6\u0BD8-\u0BE5\u0BFB-\u0C00\u0C04\u0C0D\u0C11\u0C29\u0C34\u0C3A-\u0C3C\u0C45\u0C49\u0C4E-\u0C54\u0C57\u0C5A-\u0C5F\u0C64\u0C65\u0C70-\u0C77\u0C80\u0C81\u0C84\u0C8D\u0C91\u0CA9\u0CB4\u0CBA\u0CBB\u0CC5\u0CC9\u0CCE-\u0CD4\u0CD7-\u0CDD\u0CDF\u0CE4\u0CE5\u0CF0\u0CF3-\u0D01\u0D04\u0D0D\u0D11\u0D3B\u0D3C\u0D45\u0D49\u0D4F-\u0D56\u0D58-\u0D5F\u0D64\u0D65\u0D76-\u0D78\u0D80\u0D81\u0D84\u0D97-\u0D99\u0DB2\u0DBC\u0DBE\u0DBF\u0DC7-\u0DC9\u0DCB-\u0DCE\u0DD5\u0DD7\u0DE0-\u0DF1\u0DF5-\u0E00\u0E3B-\u0E3E\u0E5C-\u0E80\u0E83\u0E85\u0E86\u0E89\u0E8B\u0E8C\u0E8E-\u0E93\u0E98\u0EA0\u0EA4\u0EA6\u0EA8\u0EA9\u0EAC\u0EBA\u0EBE\u0EBF\u0EC5\u0EC7\u0ECE\u0ECF\u0EDA\u0EDB\u0EE0-\u0EFF\u0F48\u0F6D-\u0F70\u0F98\u0FBD\u0FCD\u0FDB-\u0FFF\u10C6\u10C8-\u10CC\u10CE\u10CF\u1249\u124E\u124F\u1257\u1259\u125E\u125F\u1289\u128E\u128F\u12B1\u12B6\u12B7\u12BF\u12C1\u12C6\u12C7\u12D7\u1311\u1316\u1317\u135B\u135C\u137D-\u137F\u139A-\u139F\u13F5-\u13FF\u169D-\u169F\u16F1-\u16FF\u170D\u1715-\u171F\u1737-\u173F\u1754-\u175F\u176D\u1771\u1774-\u177F\u17DE\u17DF\u17EA-\u17EF\u17FA-\u17FF\u180F\u181A-\u181F\u1878-\u187F\u18AB-\u18AF\u18F6-\u18FF\u191D-\u191F\u192C-\u192F\u193C-\u193F\u1941-\u1943\u196E\u196F\u1975-\u197F\u19AC-\u19AF\u19CA-\u19CF\u19DB-\u19DD\u1A1C\u1A1D\u1A5F\u1A7D\u1A7E\u1A8A-\u1A8F\u1A9A-\u1A9F\u1AAE-\u1AFF\u1B4C-\u1B4F\u1B7D-\u1B7F\u1BF4-\u1BFB\u1C38-\u1C3A\u1C4A-\u1C4C\u1C80-\u1CBF\u1CC8-\u1CCF\u1CF7-\u1CFF\u1DE7-\u1DFB\u1F16\u1F17\u1F1E\u1F1F\u1F46\u1F47\u1F4E\u1F4F\u1F58\u1F5A\u1F5C\u1F5E\u1F7E\u1F7F\u1FB5\u1FC5\u1FD4\u1FD5\u1FDC\u1FF0\u1FF1\u1FF5\u1FFF\u200B-\u200F\u202A-\u202E\u2060-\u206F\u2072\u2073\u208F\u209D-\u209F\u20BB-\u20CF\u20F1-\u20FF\u218A-\u218F\u23F4-\u23FF\u2427-\u243F\u244B-\u245F\u2700\u2B4D-\u2B4F\u2B5A-\u2BFF\u2C2F\u2C5F\u2CF4-\u2CF8\u2D26\u2D28-\u2D2C\u2D2E\u2D2F\u2D68-\u2D6E\u2D71-\u2D7E\u2D97-\u2D9F\u2DA7\u2DAF\u2DB7\u2DBF\u2DC7\u2DCF\u2DD7\u2DDF\u2E3C-\u2E7F\u2E9A\u2EF4-\u2EFF\u2FD6-\u2FEF\u2FFC-\u2FFF\u3040\u3097\u3098\u3100-\u3104\u312E-\u3130\u318F\u31BB-\u31BF\u31E4-\u31EF\u321F\u32FF\u4DB6-\u4DBF\u9FCD-\u9FFF\uA48D-\uA48F\uA4C7-\uA4CF\uA62C-\uA63F\uA698-\uA69E\uA6F8-\uA6FF\uA78F\uA794-\uA79F\uA7AB-\uA7F7\uA82C-\uA82F\uA83A-\uA83F\uA878-\uA87F\uA8C5-\uA8CD\uA8DA-\uA8DF\uA8FC-\uA8FF\uA954-\uA95E\uA97D-\uA97F\uA9CE\uA9DA-\uA9DD\uA9E0-\uA9FF\uAA37-\uAA3F\uAA4E\uAA4F\uAA5A\uAA5B\uAA7C-\uAA7F\uAAC3-\uAADA\uAAF7-\uAB00\uAB07\uAB08\uAB0F\uAB10\uAB17-\uAB1F\uAB27\uAB2F-\uABBF\uABEE\uABEF\uABFA-\uABFF\uD7A4-\uD7AF\uD7C7-\uD7CA\uD7FC-\uF8FF\uFA6E\uFA6F\uFADA-\uFAFF\uFB07-\uFB12\uFB18-\uFB1C\uFB37\uFB3D\uFB3F\uFB42\uFB45\uFBC2-\uFBD2\uFD40-\uFD4F\uFD90\uFD91\uFDC8-\uFDEF\uFDFE\uFDFF\uFE1A-\uFE1F\uFE27-\uFE2F\uFE53\uFE67\uFE6C-\uFE6F\uFE75\uFEFD-\uFF00\uFFBF-\uFFC1\uFFC8\uFFC9\uFFD0\uFFD1\uFFD8\uFFD9\uFFDD-\uFFDF\uFFE7\uFFEF-\uFFFB\uFFFE\uFFFF]/g;
+
+	// Replace unprintable bytes with their character codes
+	const replacedString = inputString.replace(unprintableBytesRegex, (match) => {
+		const charCode = match.charCodeAt(0);
+		return `<0x${charCode.toString(16).toUpperCase().padStart(2, '0')}>`;
+	});
+
+	return replacedString;
+}
+
+function replaceNewlines(template) {
+	return Object.fromEntries(
+		Object.entries(template).map(([key, value]) => [key, value?.replaceAll("\\n", "\n")])
+	);
+}
+
+function regexSplitString(str, separator, limit) {
+	const result = [];
+	const separators = [];
+	let lastIndex = 0;
+	let match;
+	const regex = new RegExp(separator, 'g');
+	
+	while ((match = regex.exec(str)) !== null) {
+			if (limit !== undefined && result.length >= limit) break;
+
+			result.push(str.slice(lastIndex, match.index));
+			separators.push(match[0]);
+			lastIndex = match.index + match[0].length;
+	}
+	
+	result.push(str.slice(lastIndex)); // Add the remainder of the string
+	
+	return [result, separators];
+}
+
+function regexIndexOf(string, regex, startpos) {
+    var indexOf = string.substring(startpos || 0).search(regex);
+    return (indexOf >= 0) ? (indexOf + (startpos || 0)) : indexOf;
+}
+
+function regexLastIndexOf(string, regex, startpos) {
+    regex = (regex.global) ? regex : new RegExp(regex.source, "g" + (regex.ignoreCase ? "i" : "") + (regex.multiLine ? "m" : ""));
+    if(typeof (startpos) == "undefined") {
+        startpos = string.length;
+    } else if(startpos < 0) {
+        startpos = 0;
+    }
+    var stringToWorkWith = string.substring(0, startpos + 1);
+    var lastIndexOf = -1;
+    var nextStop = 0;
+    var result;
+    while((result = regex.exec(stringToWorkWith)) != null) {
+        lastIndexOf = result.index;
+        regex.lastIndex = ++nextStop;
+    }
+    return lastIndexOf;
+}
+
+function memoize(fn) {
+	let cache = {};
+	return (...args) => {
+		let n = args[0];
+		if (n in cache) {
+			return cache[n];
+		}
+		else {
+			let result = fn(n);
+			cache[n] = result;
+			return result;
+		}
+	}
+}
+
+function escapeRegExp(string) {
+	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
+function makeWhiteSpaceLenient(string) {
+	return string.replace(/\s+/g, '')
+		// Add \s* between characters, but preserve escaped sequences
+		.replace(/(?<!\\)(?:\\{2})*(?!\s)(?!$)/g, '$&\\s*');
+}
+
+const createLenientPrefixRegex = memoize((prefix) => {
+	return new RegExp("^" + makeWhiteSpaceLenient(escapeRegExp(prefix)), 'i');
+});
+
+const createLenientRegex = memoize((suffix) => {
+	return new RegExp(makeWhiteSpaceLenient(escapeRegExp(suffix)), 'i');
+});
+
+function prefixMatchLength(str1, str2) {
+	if (str1 === "" || str2 === "") {
+		return 0;
+	}
+
+	for (let len = str1.length; len > 0; len--) {
+		for (let i = 0; i <= str1.length - len; i++) {
+			const sub = str1.substring(i, i + len);
+			if (str2.startsWith(sub)) {
+				return len;
+			}
+		}
+	}
+
+	return 0;
+}
+
+function useSessionState(sessionStorage, name, initialState) {
+	const savedState = useMemo(() => {
+		try {
+			return sessionStorage.getProperty(name);
+		} catch (e) {
+			reportError(e);
+			return null;
+		}
+	}, []);
+
+	const [value, setValue] = useState(savedState ?? initialState);
+
+	useEffect(() => {
+		function deepCopy(value) {
+			return JSON.parse(JSON.stringify(value));
+		}
+		function onSessionChange() {
+			setValue(sessionStorage.getProperty(name) ?? deepCopy(initialState));
+		}
+
+		sessionStorage.addEventListener('sessionchange', onSessionChange);
+		return () => sessionStorage.removeEventListener('sessionchange', onSessionChange);
+	}, []);
+
+	const updateState = (newValue) => {
+		setValue((prevValue) => {
+			const updatedValue = typeof newValue === 'function' ? newValue(prevValue) : newValue;
+			sessionStorage.setProperty(name, updatedValue);
+			return updatedValue;
+		});
+	};
+
+	return [value, updateState];
+}
+
+function useDBTemplates(templateStorage, initialState) {
+	const savedState = useMemo(() => templateStorage.templates, []);
+
+	const [value, setValue] = useState(Object.keys(savedState).length === 0 ? initialState : savedState);
+
+	const updateState = (newValue) => {
+		setValue((prevValue) => {
+			const updatedValue = typeof newValue === 'function' ? newValue(prevValue) : newValue;
+			templateStorage.saveTemplates(updatedValue)
+			return updatedValue;
+		});
+	};
+
+	return [value, updateState];
+}
+
+function usePersistentState(name, initialState) {
+	const savedState = useMemo(() => {
+		try {
+			return JSON.parse(localStorage.getItem(name));
+		} catch (e) {
+			reportError(e);
+			return null;
+		}
+	}, []);
+
+	const [value, setValue] = useState(savedState ?? initialState);
+
+	const updateState = (newValue) => {
+		setValue((prevValue) => {
+			const updatedValue = typeof newValue === 'function' ? newValue(prevValue) : newValue;
+			localStorage.setItem(name, JSON.stringify(updatedValue));
+			return updatedValue;
+		});
+	};
+
+	return [value, updateState];
+}
+
+export function App({ sessionStorage, templateStorage, useSessionState, useDBTemplates, isMikupadEndpoint }) {
+	const promptArea = useRef();
+	const promptOverlay = useRef();
+	const undoStack = useRef([]);
+	const redoStack = useRef([]);
+	const probsDelayTimer = useRef();
+	const keyState = useRef({});
+	const sessionReconnectTimer = useRef();
+	const useScrollSmoothing = useRef(true);
+	const hordeTaskId = useRef();
+	const promptPreviewElement = useRef();
+	const [templates, setTemplates] = useDBTemplates(defaultPresets.instructTemplates);
+	const [templateReplacements, setTemplateReplacements] = useState(false);
+	const [templatesImport, setTemplatesImport] = useState(false);
+	const [selectedTemplate, setSelectedTemplate] = useSessionState('template', "Mistral");
+	const [chatMode, setChatMode] = useSessionState('chatMode', false);
+	const [templateList, setTemplateList] = useState([]);
+	const [currentPromptChunk, setCurrentPromptChunk] = useState(undefined);
+	const [undoHovered, setUndoHovered] = useState(false);
+	const [showProbs, setShowProbs] = useState(true);
+	const [cancel, setCancel] = useState(null);
+	const [fontSizeMultiplier, setFontSizeMultiplier] = usePersistentState('fontSizeMult', 1.0);
+	const [spellCheck, setSpellCheck] = usePersistentState('spellCheck', false);
+	const [attachSidebar, setAttachSidebar] = usePersistentState('attachSidebar', false);
+	const [showProbsMode, setShowProbsMode] = usePersistentState('showProbsMode', 0);
+	const [__highlightGenTokens, __1] = usePersistentState('highlightGenTokens', true); // obsolete!
+	const [tokenHighlightMode, setTokenHighlightMode] = usePersistentState('tokenHighlightMode', __highlightGenTokens ? 0 : -1);
+	const [__colorizePerplexity, __2] = usePersistentState('colorizePerplexity', false); // obsolete!
+	const [tokenColorMode, setTokenColorMode] = usePersistentState('tokenColorMode', __colorizePerplexity ? 2 : 0);
+	const [preserveCursorPosition, setPreserveCursorPosition] = usePersistentState('preserveCursorPosition', true);
+	const [promptAreaWidth, setPromptAreaWidth] = usePersistentState('promptAreaWidth', undefined);
+	const [theme, setTheme] = usePersistentState('theme', 0);
+	const [sessionEndpointConnecting, setSessionEndpointConnecting] = useState(false);
+	const [sessionEndpointError, setSessionEndpointError] = useState(undefined);
+	const [showAPIKey, setShowAPIKey] = useState(false);
+	const [endpoint, setEndpoint] = useSessionState('endpoint', defaultPresets.endpoint);
+	const [endpointAPI, setEndpointAPI] = useSessionState('endpointAPI', defaultPresets.endpointAPI);
+	const [endpointAPIKey, setEndpointAPIKey] = useSessionState('endpointAPIKey', defaultPresets.endpointAPIKey);
+	const [endpointModel, setEndpointModel] = useSessionState('endpointModel', defaultPresets.endpointModel);
+	const [promptChunks, setPromptChunks] = useSessionState('prompt', defaultPresets.prompt);
+	const [seed, setSeed] = useSessionState('seed', defaultPresets.seed);
+	const [maxPredictTokens, setMaxPredictTokens] = useSessionState('maxPredictTokens', defaultPresets.maxPredictTokens);
+	const [temperature, setTemperature] = useSessionState('temperature', defaultPresets.temperature);
+	const [dynaTempRange, setDynaTempRange] = useSessionState('dynaTempRange', defaultPresets.dynaTempRange);
+	const [dynaTempExp, setDynaTempExp] = useSessionState('dynaTempExp', defaultPresets.dynaTempExp);
+	const [repeatPenalty, setRepeatPenalty] = useSessionState('repeatPenalty', defaultPresets.repeatPenalty);
+	const [repeatLastN, setRepeatLastN] = useSessionState('repeatLastN', defaultPresets.repeatLastN);
+	const [penalizeNl, setPenalizeNl] = useSessionState('penalizeNl', defaultPresets.penalizeNl);
+	const [presencePenalty, setPresencePenalty] = useSessionState('presencePenalty', defaultPresets.presencePenalty);
+	const [frequencyPenalty, setFrequencyPenalty] = useSessionState('frequencyPenalty', defaultPresets.frequencyPenalty);
+	const [topK, setTopK] = useSessionState('topK', defaultPresets.topK);
+	const [topP, setTopP] = useSessionState('topP', defaultPresets.topP);
+	const [typicalP, setTypicalP] = useSessionState('typicalP', defaultPresets.typicalP);
+	const [minP, setMinP] = useSessionState('minP', defaultPresets.minP);
+	const [tfsZ, setTfsZ] = useSessionState('tfsZ', defaultPresets.tfsZ);
+	const [mirostat, setMirostat] = useSessionState('mirostat', defaultPresets.mirostat);
+	const [mirostatTau, setMirostatTau] = useSessionState('mirostatTau', defaultPresets.mirostatTau);
+	const [mirostatEta, setMirostatEta] = useSessionState('mirostatEta', defaultPresets.mirostatEta);
+	const [xtcThreshold, setXtcThreshold] = useSessionState('xtcThreshold', defaultPresets.xtcThreshold);
+	const [xtcProbability, setXtcProbability] = useSessionState('xtcProbability', defaultPresets.xtcProbability);
+	const [dryMultiplier, setDryMultiplier] = useSessionState('dryMultiplier', defaultPresets.dryMultiplier);
+	const [dryBase, setDryBase] = useSessionState('dryBase', defaultPresets.dryBase);
+	const [dryAllowedLength, setDryAllowedLength] = useSessionState('dryAllowedLength', defaultPresets.dryAllowedLength);
+	const [dryPenaltyRange, setDryPenaltyRange] = useSessionState('dryPenaltyRange', defaultPresets.dryPenaltyRange);
+	const [drySequenceBreakers, setDrySequenceBreakers] = useSessionState('drySequenceBreakers', defaultPresets.drySequenceBreakers);
+	const [drySequenceBreakersError, setDrySequenceBreakersError] = useState(undefined);
+	const [bannedTokens, setBannedTokens] = useSessionState('bannedTokens', defaultPresets.bannedTokens);
+	const [bannedTokensError, setBannedTokensError] = useState(undefined);
+	const [ignoreEos, setIgnoreEos] = useSessionState('ignoreEos', defaultPresets.ignoreEos);
+	const [openaiPresets, setOpenaiPresets] = useSessionState('openaiPresets', defaultPresets.openaiPresets);
+	const [rejectedAPIKey, setRejectedAPIKey] = useState(false);
+	const [openaiModels, setOpenaiModels] = useState([]);
+	const [tokens, setTokens] = useState(0);
+	const [tokensPerSec, setTokensPerSec] = useState(0.0);
+	const [predictStartTokens, setPredictStartTokens] = useState(0);
+	const [lastError, setLastError] = useState(undefined);
+	const [stoppingStrings, setStoppingStrings] = useSessionState('stoppingStrings', defaultPresets.stoppingStrings);
+	const [stoppingStringsError, setStoppingStringsError] = useState(undefined);
+	const [savedScrollTop, setSavedScrollTop] = useSessionState('scrollTop', defaultPresets.scrollTop);
+	const [modalState, setModalState] = useState({});
+	const [logitBias, setLogitBias] = useSessionState('logitBias', defaultPresets.logitBias);
+	const [logitBiasParam, setLogitBiasParam] = useState({});
+	const [contextLength, setContextLength] = useSessionState('contextLength', defaultPresets.contextLength);
+	const [memoryTokens, setMemoryTokens] = useSessionState('memoryTokens', defaultPresets.memoryTokens);
+	const [authorNoteTokens, setAuthorNoteTokens] = useSessionState('authorNoteTokens', defaultPresets.authorNoteTokens);
+	const [authorNoteDepth, setAuthorNoteDepth] = useSessionState('authorNoteDepth', defaultPresets.authorNoteDepth);
+	const [worldInfo, setWorldInfo] = useSessionState('worldInfo', defaultPresets.worldInfo);
+	const [sillyTarvernWorldInfoJSON, setSillyTarvernWorldInfoJSON] = useState(null);
+	const [enabledSamplers, setEnabledSamplers] = useSessionState('enabledSamplers', defaultPresets.enabledSamplers);
+	const [grammar, setGrammar] = useSessionState('grammar', defaultPresets.grammar);
+	const [contextMenuState, setContextMenuState] = useState({ visible: false, x: 0, y: 0 });
+	const [instructModalState, setInstructModalState] = useState({});
+	const [hordeQueuePos, setHordeQueuePos] = useState(undefined);
+	const [hordeProcessing, setHordeProcessing] = useState(false);
+	const [useChatAPI, setUseChatAPI] = useSessionState('chatAPI', defaultPresets.chatAPI);
+	const [useTokenStreaming, setUseTokenStreaming] = useSessionState('tokenStreaming', defaultPresets.tokenStreaming);
+	const [promptPreviewChunks, setPromptPreviewChunks] = useState([]);
+	const [promptPreviewReroll, setPromptPreviewReroll] = useState(0);
+	const [showPromptPreview, setShowPromptPreview] = useSessionState('promptPreview', defaultPresets.promptPreview);
+	const [promptPreviewTokens, setPromptPreviewTokens] = useSessionState('promptPreviewTokens', defaultPresets.promptPreviewTokens);
+
+	function replacePlaceholders(string,placeholders) {
+		// give placeholders as json object
+		// { "placeholder":"replacement" }
+		return string.replace(/\{[^}]+\}/g, function (placeholder) {
+			return placeholders.hasOwnProperty(placeholder)
+				? placeholders[placeholder]
+				: placeholder;
+		}).replace(/\\n/g, '\n')
+	};
+	useMemo(() => {
+		setTemplateReplacements({
+			"{inst}": templates[selectedTemplate]?.instPre && templates[selectedTemplate]?.instPre !== ""
+				? templates[selectedTemplate]?.instPre
+				: "",
+			"{/inst}": templates[selectedTemplate]?.instSuf && templates[selectedTemplate]?.instSuf !== ""
+				? templates[selectedTemplate]?.instSuf
+				: "",
+			"{sys}": templates[selectedTemplate]?.sysPre && templates[selectedTemplate]?.sysPre !== ""
+				? templates[selectedTemplate]?.sysPre
+				: "",
+			"{/sys}": templates[selectedTemplate]?.sysSuf && templates[selectedTemplate]?.sysSuf !== ""
+				? templates[selectedTemplate]?.sysSuf
+				: "",
+		})
+	}, [selectedTemplate,templates])
+
+	// AN and Memory
+	function handleauthorNoteTokensChange(key,value) {
+		setAuthorNoteTokens((prevauthorNoteTokens) => ({ ...prevauthorNoteTokens, [key]: value }));
+	}
+	// token counts for an
+	useEffect(() => {
+		const order = ["prefix","text","suffix"]
+		const assembled = authorNoteTokens.text && authorNoteTokens.text !== ""
+			? order.map(key => authorNoteTokens[key]).join("")
+			: "";	
+		if (assembled == "" || endpointAPI == API_OPENAI_COMPAT) {
+			setAuthorNoteTokens((prevauthorNoteTokens) => ({ ...prevauthorNoteTokens, "tokens": 0 }))
+			return
+		}
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			try {
+				const tokenCount = await getTokenCount({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: `${replacePlaceholders(assembled,templateReplacements)}`,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setAuthorNoteTokens((prevauthorNoteTokens) => ({
+					...prevauthorNoteTokens,
+					"tokens": tokenCount - 1 
+				}));
+			} catch (e) {
+				if (e.name !== 'AbortError'){
+					reportError(e);
+					setAuthorNoteTokens((prevauthorNoteTokens) => ({ ...prevauthorNoteTokens, "tokens": 0 }))
+				}	
+			}
+		}, 500);
+
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	},[modalState["context"],authorNoteTokens.text,authorNoteTokens.prefix,authorNoteTokens.suffix,contextLength,cancel,endpoint,endpointAPI])
+
+	function handleMemoryTokensChange(key,value) {
+		setMemoryTokens((prevMemoryTokens) => ({ ...prevMemoryTokens, [key]: value }));
+	}
+	// token counts for memory
+	useEffect(() => {
+		const order = ["prefix","text","suffix"]
+		const assembled = memoryTokens.text && memoryTokens.text !== ""
+			? order.map(key => memoryTokens[key]).join("")
+			: "";	
+		if (assembled == "" || endpointAPI == API_OPENAI_COMPAT){
+			setMemoryTokens((prevMemoryTokens) => ({ ...prevMemoryTokens, "tokens": 0 }));
+			return
+		}
+
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			try {
+				const tokenCount = await getTokenCount({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: `${replacePlaceholders(assembled,templateReplacements)}`,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setMemoryTokens((prevMemoryTokens) => ({
+					...prevMemoryTokens,
+					"tokens": tokenCount - 1 
+				}));
+			} catch (e) {
+				if (e.name !== 'AbortError'){
+					reportError(e);
+					setMemoryTokens((prevMemoryTokens) => ({ ...prevMemoryTokens, "tokens": 0 }));
+				}
+			}
+		}, 500);
+
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	},[modalState["context"],memoryTokens.text,memoryTokens.prefix,memoryTokens.suffix,cancel,endpoint,endpointAPI])
+	// token counts for wi
+	useEffect(() => {
+		const assembled = memoryTokens.worldInfo && memoryTokens.worldInfo !== ""
+			? [worldInfo.prefix,memoryTokens.worldInfo,worldInfo.suffix].join("")
+			: "";
+		if (assembled == "" || endpointAPI == API_OPENAI_COMPAT){
+			setMemoryTokens((prevMemoryTokens) => ({ ...prevMemoryTokens, "tokensWI": 0 }));
+			return
+		}
+
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			try {
+				const tokenCount = await getTokenCount({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: `${replacePlaceholders(assembled,templateReplacements)}`,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setMemoryTokens((prevMemoryTokens) => ({
+					...prevMemoryTokens,
+					"tokensWI": tokenCount - 1 
+				}));
+			} catch (e) {
+				if (e.name !== 'AbortError'){
+					reportError(e);
+					setMemoryTokens((prevMemoryTokens) => ({ ...prevMemoryTokens, "tokensWI": 0 }));
+				}
+			}
+		}, 500);
+
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	},[modalState["context"],worldInfo.prefix,memoryTokens.worldInfo,worldInfo.suffix,cancel,endpoint,endpointAPI])
+
+
+
+	const insertTemplate = (sysInst) => {
+		// most of this function is shamelessly stolen from culturedniichan's deleted pull
+		// request for a similar implementation of instruct templates:
+		// https://github.com/lmg-anon/mikupad/pull/31
+
+		let [prefix,suffix] = sysInst == "sys"
+			? [templates[selectedTemplate]?.sysPre  || "", templates[selectedTemplate]?.sysSuf  || ""]
+			: [templates[selectedTemplate]?.instPre || "", templates[selectedTemplate]?.instSuf || ""];
+		if (!(prefix || suffix))
+			return;
+
+		prefix = prefix.replace(/\\n/g,'\n');
+		suffix = suffix.replace(/\\n/g,'\n');
+
+		const elem = promptArea.current;
+		if (!elem)
+			return;
+
+		const startPos = elem.selectionStart;
+		const endPos = elem.selectionEnd;
+		const textBefore = elem.value.substring(0, startPos) || "";
+		const textAfter = (sysInst !== "sys" && elem.selectionEnd !== elem.value.length ? "{predict}" : "") + elem.value.substring(endPos);
+		const selectedText = elem.value.substring(startPos, endPos);
+
+		const finalText = textBefore 
+						+ prefix
+						+ selectedText 
+						+ suffix
+						+ textAfter;
+
+		const scrollTop = elem.scrollTop;
+		
+		elem.value = finalText;
+
+		let newCursorPos;
+		if (selectedText.length === 0) {
+			newCursorPos = startPos + prefix.length;
+		} else {
+			newCursorPos = startPos 
+				+ prefix.length
+				+ selectedText.length 
+				+ suffix.length;
+		}
+		elem.focus();
+		elem.setSelectionRange(newCursorPos, newCursorPos);
+		onInput({ target: elem });
+
+		elem.scrollTop = scrollTop;
+	}
+
+	const toggleModal = (modalKey) => {
+		setShowProbs(false);
+		setModalState((prevState) => ({
+			...prevState,
+			[modalKey]: !prevState[modalKey],
+		}));
+	};
+	const closeModal = (modalKey) => {
+		setModalState((prevState) => ({
+			...prevState,
+			[modalKey]: false,
+		}));
+	};
+
+
+	const promptText = useMemo(() => joinPrompt(promptChunks), [promptChunks]);
+
+	const { modifiedPromptText, fimPromptInfo } = useMemo(() => {
+		if (cancel)
+			return { modifiedPromptText: promptText };
+
+		const fillPlaceholder = "{fill}";
+		const predictPlaceholder = "{predict}";
+
+		let placeholderRegex = predictPlaceholder;
+		if (templates[selectedTemplate]?.fimTemplate !== undefined && templates[selectedTemplate]?.fimTemplate.length > 0)
+			placeholderRegex += `|${fillPlaceholder}`;
+
+		let leftPromptChunks = undefined;
+		let rightPromptChunks = undefined;
+		let foundPlaceholder = undefined;
+
+		for (let i = 0; i < promptChunks.length; i++) {
+			const chunk = promptChunks[i];
+			if (chunk.type !== 'user')
+				continue;
+			
+			if (chunk.content.includes(fillPlaceholder) || chunk.content.includes(predictPlaceholder)) {
+				// split the chunk in 2
+				let [sides, separators] = regexSplitString(chunk.content, placeholderRegex, 1);
+				foundPlaceholder = separators[0];
+
+				let left = sides[0];
+				if ((left.at(-2) != ' ' || left.at(-2) != '\t') && left.at(-1) == ' ') {
+					// This is most likely an unintentional mistake by the user.
+					left = left.substring(0, left.length - 1);
+				}
+				leftPromptChunks = [
+					...promptChunks.slice(0, i),
+					...(left ? [{ type: 'user', content: left }] : [])
+				];
+
+				let right = sides[1];
+				rightPromptChunks = [
+					...(right ? [{ type: 'user', content: right }] : []),
+					...promptChunks.slice(i + 1, promptChunks.length),
+				];
+				break;
+			}
+		}
+
+		if (foundPlaceholder === undefined)
+			return { modifiedPromptText: promptText };
+
+		let modifiedPromptText;
+		if (foundPlaceholder == '{fill}') {
+			const prefix = joinPrompt(leftPromptChunks);
+			const suffix = joinPrompt(rightPromptChunks);
+
+			modifiedPromptText = replacePlaceholders(templates[selectedTemplate].fimTemplate, {
+				'{prefix}': prefix,
+				'{suffix}': suffix
+			});
+		} else {
+			modifiedPromptText = joinPrompt(leftPromptChunks);
+		}
+
+		const fimPromptInfo = {
+			fimLeftChunks: leftPromptChunks,
+			fimRightChunks: rightPromptChunks,
+			fimPlaceholder: foundPlaceholder
+		};
+
+		return {
+			modifiedPromptText,
+			fimPromptInfo
+		};
+	}, [promptChunks, templates, selectedTemplate, cancel]);
+
+	// compute separately as I imagine this can get expensive
+	const assembledWorldInfo = useMemo(() => {
+		// assemble non-empty wi
+		const validWorldInfo = !Array.isArray(worldInfo.entries) ? [] : worldInfo.entries.filter(entry =>
+			entry.keys.length > 0 && !(entry.keys.length == 1 && entry.keys[0] == "") && entry.text !== "");
+
+		// search prompt
+		const activeWorldInfo = validWorldInfo.filter(entry => {
+			if (validWorldInfo.length < 1) { return }
+			// default to 2048
+			const searchRange = isNaN(entry.search) || entry.search === ""
+				? 2048
+				: Number(entry.search);
+
+			// truncate to search range. using promptText allows for search ranges larger than context
+			const searchPrompt = modifiedPromptText.substring(modifiedPromptText.length - searchRange * defaultPresets.tokenRatio);
+
+			// search in range
+			return entry.keys.some((key, index) => {
+				// don't waste resources on disabled entries
+				if (searchPrompt.length == 0) {
+					return
+				}
+
+				// an invalid regex here can completely lock you out of mikupad until you clear
+				// localStorage, so this is necessary to handle that.
+				try {
+					return new RegExp(key, "i").test(searchPrompt) && key !== "";
+				}
+				catch (error) {
+					console.error(`Error in RegEx for key '${key}': ${error.message}`);
+					return false;
+				}
+			});
+		});
+
+		return activeWorldInfo.length > 0
+			? activeWorldInfo.map(entry => entry.text).join("\n")
+			: "";
+	}, [modifiedPromptText, worldInfo]);
+
+	const additionalContextPrompt = useMemo(() => {
+		// add world info to memory for easier assembly
+		memoryTokens["worldInfo"] = assembledWorldInfo;
+
+		const order = ["prefix","text","suffix"]
+		const assembledAuthorNote = authorNoteTokens.text && authorNoteTokens.text !== ""
+			? order.map(key => authorNoteTokens[key]).join("").replace(/\\n/g,'\n')
+			: "";
+
+		// replacements for the contextOrder string
+		const contextReplacements = {
+			"{wiPrefix}": assembledWorldInfo && assembledWorldInfo !== ""
+				? worldInfo.prefix
+				: "", // wi prefix and suffix will be added whenever wi isn't empty
+			"{wiText}": assembledWorldInfo,
+			"{wiSuffix}": assembledWorldInfo && assembledWorldInfo !== ""
+				? worldInfo.suffix
+				: "",
+
+			"{memPrefix}": memoryTokens.text && memoryTokens.text !== "" || assembledWorldInfo !== ""
+				? memoryTokens.prefix
+				: "", // memory prefix and suffix will be added whenever memory or wi aren't empty
+			"{memText}": memoryTokens.text,
+			"{memSuffix}": memoryTokens.text && memoryTokens.text !== "" || assembledWorldInfo !== ""
+				? memoryTokens.suffix
+				: "",
+		}
+
+		// prompt length estimation
+		const additionalContext = (Object.values(contextReplacements)
+			.filter(value => typeof value === 'string').join('')).length;
+		const estimatedContextStart = Math.round(
+			modifiedPromptText.length - contextLength * defaultPresets.tokenRatio + additionalContext) + 1;
+
+		// trunkate prompt to context limit
+		const truncPrompt = modifiedPromptText.substring(estimatedContextStart);
+
+		// make injection depth valid
+		const truncPromptLen = truncPrompt.split('\n').length;
+		const injDepth = truncPromptLen > authorNoteDepth ? authorNoteDepth : truncPromptLen
+
+		const lines = truncPrompt.match(/.*\n?/g);
+		const injIndex = lines.length-injDepth-1
+		// inject an
+		lines.splice(injIndex,0,assembledAuthorNote)
+		// if an, return an context, else return original truncated context
+		const authorNotePrompt = assembledAuthorNote != ""
+			? lines.join('')
+			: truncPrompt;
+
+		// add the final replacement
+		contextReplacements["{prompt}"] = authorNotePrompt
+
+		const workingContextOrder = memoryTokens.contextOrder && memoryTokens.contextOrder !== ""
+			? memoryTokens.contextOrder
+			: defaultPresets.memoryTokens.contextOrder;
+
+		// assemble context in order:
+		// the context is (1) split by line, (2) persistent context placeholders are 
+		// replaced, (3) instruct template placeholders are replaced (4) non-empty
+		// lines are joined back together.
+		const permContextPrompt = workingContextOrder.split("\n").map(function (line) {
+			return replacePlaceholders(line,contextReplacements)
+		}).filter(function (line) {
+			return line.trim() !== "";
+		}).join("\n").replace(/\\n/g, '\n');
+
+		return permContextPrompt;
+	}, [contextLength, modifiedPromptText, memoryTokens, authorNoteTokens, authorNoteDepth, assembledWorldInfo, worldInfo.prefix, worldInfo.suffix]);
+
+	const finalPromptText = useMemo(() => {
+		return replacePlaceholders(additionalContextPrompt, templateReplacements);
+	}, [additionalContextPrompt, templates, selectedTemplate]);
+
+	// predicts the prompt preview
+	useEffect(() => {
+		if (promptPreviewChunks.length)
+			setPromptPreviewChunks([]);
+		
+		if (fimPromptInfo !== undefined || cancel || endpointAPI == API_AI_HORDE || tokenHighlightMode === -1 || !showPromptPreview)
+			return;
+
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			const customParams = {
+				n_predict: promptPreviewTokens
+			};
+
+			const predicted = await predict(finalPromptText, promptChunks.length, (chunk) => {
+				setPromptPreviewChunks((c) => [...c, chunk]);
+				return true;
+			}, ac, customParams);
+		}, 500);
+
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	}, [finalPromptText, showPromptPreview, promptPreviewReroll, cancel, endpoint, endpointAPI, endpointAPIKey]);
+
+	const promptPreviewText = useMemo(() => joinPrompt(promptPreviewChunks), [promptPreviewChunks]);
+
+	// predicts one {fill} placeholder
+	async function fillPredict() {
+		if (fimPromptInfo === undefined)
+			return false;
+
+		const { fimLeftChunks, fimRightChunks } = fimPromptInfo;
+		predict(finalPromptText, fimLeftChunks.length, (chunk) => {
+			fimLeftChunks.push(chunk);
+			setPromptChunks(p => [
+				...fimLeftChunks,
+				...fimRightChunks
+			]);
+			setTokens(t => t + (chunk?.completion_probabilities?.length ?? 1));
+			return true;
+		});
+
+		return true;
+	}
+	
+	function convertChatToJSON(chatString, template) {
+		function extractMessage(text, prefix, suffixes, role) {
+			const matches = text.match(createLenientPrefixRegex(prefix));
+			if (matches && matches.length) {
+				text = text.substring(matches[0].length);
+				let endIndex = suffixes[0] ? regexIndexOf(text, createLenientRegex(suffixes[0])) : -1;
+				if (endIndex === -1) {
+					if (suffixes.length > 1) {
+						const indices = suffixes.slice(1).map(suffix => suffix ? regexIndexOf(text, createLenientRegex(suffix)) : -1).filter(index => index !== -1);
+						endIndex = indices.length > 0 ? Math.min(...indices) : text.length;
+					}  else {
+						endIndex = text.length;
+					}
+				}
+				let content = text.substring(0, endIndex);
+				content = endIndex !== text.length ? content.trim() : content.trimLeft();
+				return {
+					message: { role, content },
+					remainingString: text.substring(endIndex)
+				};
+			}
+			return null;
+		}
+
+		function skipToNextKnownPrefix(text, ...prefixes) {
+			const indices = prefixes.map(prefix => prefix ? regexIndexOf(text, createLenientRegex(prefix)) : -1).filter(index => index !== -1);
+			const minIndex = indices.length > 0 ? Math.min(...indices) : text.length;
+			if (minIndex == 0) {
+				console.warn("Something went wrong!");
+				return "";
+			}
+			return text.substring(minIndex);
+		}
+		
+		const messages = [];
+		const { sysPre, sysSuf, instPre, instSuf } = replaceNewlines(template);
+
+		let remainingString = chatString.trimStart();
+
+		const indices = [sysPre, instPre].map(prefix => prefix ? regexIndexOf(remainingString, createLenientPrefixRegex(prefix)) : -1).filter(index => index !== -1);
+		const minIndex = indices.length > 0 ? Math.min(...indices) : remainingString.length;
+		if (minIndex !== 0) {
+			// The prompt doesn't start with any of the prefixes.
+			// So let's assume it's a instruction.
+			const matchLen = prefixMatchLength(instPre.trim(), remainingString);
+			remainingString = instPre + remainingString.substring(matchLen);
+		}
+
+		while (remainingString.length > 0) {
+			let extracted = null;
+			if (sysPre) {
+				extracted = extractMessage(remainingString, sysPre, [sysSuf, instPre, instSuf], 'system');
+			}
+			if (instPre && !extracted) {
+				extracted = extractMessage(remainingString, instPre, [instSuf], 'user');
+			}
+			if (instSuf && !extracted) {
+				extracted = extractMessage(remainingString, instSuf, [instPre], 'assistant');
+			}
+			if (!extracted) {
+				remainingString = skipToNextKnownPrefix(remainingString, sysPre, instPre, instSuf);
+				continue;
+			}
+			messages.push(extracted.message);
+			remainingString = extracted.remainingString;
+		}
+
+		const lastMessage = messages?.at(-1);
+		if (lastMessage && lastMessage.role === 'assistant' && lastMessage.content.length === 0) {
+			messages.pop();
+		}
+
+		return messages;
+	}
+
+	async function predict(prompt = finalPromptText, chunkCount = promptChunks.length, callback = undefined, abortController = undefined, customParams = {}) {
+		if (!abortController && cancel) {
+			cancel?.();
+
+			// llama.cpp server sometimes generates gibberish if we stop and
+			// restart right away (???)
+			let cancelled = false;
+			setCancel(() => () => cancelled = true);
+			await new Promise(resolve => setTimeout(resolve, 500));
+			if (cancelled)
+				return false;
+		}
+
+		// predict the fill placeholder if it is present in the prompt.
+		if (!callback && !restartedPredict && await fillPredict())
+			return true;
+
+		let ac;
+		let cancelThis;
+		if (!abortController) {
+			ac = new AbortController();
+			cancelThis = () => {
+				abortCompletion({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_AI_HORDE ? { hordeTaskId: hordeTaskId.current } : {}),
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				ac.abort();
+			};
+			setCancel(() => cancelThis);
+		} else {
+			ac = abortController;
+			cancelThis = () => {
+				abortCompletion({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_AI_HORDE ? { hordeTaskId: hordeTaskId.current } : {}),
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+			};
+			ac.signal.addEventListener('abort', cancelThis);
+		}
+		setLastError(undefined);
+
+		let predictCount = 0;
+
+		try {
+			// sometimes "getTokenCount" can take a while because the server is busy
+			// so let's set the predictStartTokens beforehand.
+			setPredictStartTokens(tokens);
+
+			if (!callback) {
+				const tokenCount = await getTokenCount({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: prompt,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setTokens(tokenCount);
+				setPredictStartTokens(tokenCount);
+
+				// Chat Mode
+				if ((chatMode || useChatAPI) && !restartedPredict && templates[selectedTemplate]) {
+					// add user EOT template (instruct suffix) if not switch completion
+					const { instSuf, instPre } = replaceNewlines(templates[selectedTemplate]);
+					const instSufIndex = instSuf ? regexLastIndexOf(prompt, createLenientRegex(instSuf)) : -1;
+					const instPreIndex = instPre ? regexLastIndexOf(prompt, createLenientRegex(instPre)) : -1;
+					if (instSufIndex <= instPreIndex) {
+						setPromptChunks(p => [...p, { type: 'user', content: instSuf }])
+						prompt += instSuf;
+					}
+				}
+				setRestartedPredict(false)
+
+				while (undoStack.current.at(-1) >= chunkCount)
+					undoStack.current.pop();
+				undoStack.current.push(chunkCount);
+			} else {
+				undoStack.current = [];
+			}
+			redoStack.current = [];
+			setUndoHovered(false);
+			setRejectedAPIKey(false);
+			promptArea.current.scrollTarget = undefined;
+			useScrollSmoothing.current = true;
+
+			let startTime = 0;
+			setTokensPerSec(0.0);
+			
+			for await (const chunk of (useChatAPI ? chatCompletion : completion)({
+				endpoint,
+				endpointAPI,
+				...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP || endpointAPI == API_AI_HORDE ? {
+					endpointAPIKey,
+					model: endpointModel
+				} : {}),
+				...(useChatAPI ? { messages: convertChatToJSON(prompt, templates[selectedTemplate]) } : { prompt }),
+				...(seed != -1 ? { seed } : {}),
+				...(enabledSamplers.includes('temperature') ? {
+					temperature
+				} : {}),
+				...(!openaiPresets || endpointAPI != API_OPENAI_COMPAT ? {
+					...(enabledSamplers.includes('dynatemp') ? {
+						dynatemp_range: dynaTempRange,
+						dynatemp_exponent: dynaTempExp,
+					} : {}),
+					...(enabledSamplers.includes('rep_pen') ? {
+						repeat_penalty: repeatPenalty,
+						repeat_last_n: repeatLastN,
+					} : {}),
+					penalize_nl: penalizeNl,
+					ignore_eos: ignoreEos,
+				} : {}),
+				...(Object.keys(logitBias.bias).length > 0 ? {
+					logit_bias: logitBiasParam,
+				} : {}),
+				...((!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && grammar.length ? { grammar } : {}),
+				...(enabledSamplers.includes('pres_pen') ? {
+					presence_penalty: presencePenalty,
+				} : {}),
+				...(enabledSamplers.includes('freq_pen') ? {
+					frequency_penalty: frequencyPenalty,
+				} : {}),
+				...((enabledSamplers.includes('mirostat') && mirostat && (!openaiPresets || endpointAPI != API_OPENAI_COMPAT)) ? {
+					mirostat,
+					mirostat_tau: mirostatTau,
+					mirostat_eta: mirostatEta,
+				} : {
+					...(enabledSamplers.includes('top_p') ? {
+						top_p: topP,
+					} : {}),
+					...(!openaiPresets || endpointAPI != API_OPENAI_COMPAT ? {
+						...(enabledSamplers.includes('top_k') ? {
+							top_k: topK,
+						} : {}),
+						...(enabledSamplers.includes('typical_p') ? {
+							typical_p: typicalP,
+						} : {}),
+						...(enabledSamplers.includes('min_p') ? {
+							min_p: minP,
+						} : {}),
+						...(enabledSamplers.includes('tfs_z') ? {
+							tfs_z: tfsZ
+						} : {}),
+						...(enabledSamplers.includes('xtc') ? {
+							xtc_threshold: xtcThreshold,
+							xtc_probability: xtcProbability,
+						}: {}),
+						...(enabledSamplers.includes('dry') ? {
+							dry_multiplier: dryMultiplier,
+							dry_base: dryBase,
+							dry_allowed_length: dryAllowedLength,
+							dry_penalty_last_n: dryPenaltyRange,
+							dry_sequence_breakers: endpointAPI == API_OPENAI_COMPAT ? 
+								drySequenceBreakers : 
+								JSON.parse(drySequenceBreakers),
+						}: {}),
+						...(enabledSamplers.includes('ban_tokens') ? {
+							banned_tokens: JSON.parse(bannedTokens),
+						}: {}),
+					} : {})
+				}),
+				n_predict: maxPredictTokens,
+				n_probs: 10,
+				stream: useTokenStreaming,
+				...(JSON.parse(stoppingStrings).length ? { stop: JSON.parse(stoppingStrings) } : {}),
+				signal: ac.signal,
+				...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {}),
+				...customParams
+			})) {
+				ac.signal.throwIfAborted();
+				if (chunk.stopping_word)
+					chunk.content = chunk.stopping_word;
+				if (endpointAPI === API_AI_HORDE) {
+					switch (chunk.status) {
+					case 'queue_init':
+						hordeTaskId.current = chunk.taskId;
+						continue;
+					case 'queue_status':
+						setHordeQueuePos(chunk.position);
+						setHordeProcessing(chunk.processing);
+						continue;
+					}
+				}
+				if (!chunk.content) {
+					continue;
+				}
+				if (startTime === 0) {
+					startTime = performance.now();
+				} else {
+					if (predictCount === 1) {
+						startTime -= performance.now() - startTime; // compensate for the first token
+					}
+					const elapsedTime = (performance.now() - startTime) / 1000; // in seconds
+					setTokensPerSec((predictCount + 1) / elapsedTime);
+				}
+				if (callback) {
+					if (!callback(chunk))
+						break;
+				} else {
+					setPromptChunks(p => [...p, chunk]);
+					setTokens(t => t + (chunk?.completion_probabilities?.length ?? 1));
+				}
+				predictCount += 1;
+			}
+		} catch (e) {
+			if (e.name !== 'AbortError') {
+				reportError(e);
+				const errStr = e.toString();
+				if ((endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP) && errStr.includes("401")) {
+					setLastError("Error: Rejected API Key");
+					setRejectedAPIKey(true);
+				} else if (endpointAPI == API_OPENAI_COMPAT && errStr.includes("429")) {
+					setLastError("Error: Insufficient Quota");
+				} else {
+					setLastError(errStr);
+				}
+			}
+			return false;
+		} finally {
+			setCancel(c => c === cancelThis ? null : c);
+			if (abortController)
+				ac.signal.removeEventListener('abort', cancelThis);
+			if (!callback) {
+				if (predictCount === 0)
+					undoStack.current.pop();
+			}
+			setTokensPerSec(0.0);
+			hordeTaskId.current = undefined;
+			setHordeQueuePos(undefined);
+			setHordeProcessing(false);
+		}
+
+		// Chat Mode
+		if (!callback && (chatMode || useChatAPI) && predictCount > 0) {
+			// add bot EOT template (instruct prefix)
+			const eotBot = templates[selectedTemplate]?.instPre.replace(/\\n/g, '\n')
+			setPromptChunks(p => [...p, { type: 'user', content: eotBot }])
+			prompt += `${eotBot}`
+		}
+		
+		return true;
+	}
+
+	function undo() {
+		if (!undoStack.current.length)
+			return false;
+		redoStack.current.push(promptChunks.slice(undoStack.current.at(-1)));
+		setPromptChunks(p => p.slice(0, undoStack.current.pop()));
+		return true;
+	}
+
+	function redo() {
+		if (!redoStack.current.length)
+			return false;
+		undoStack.current.push(promptChunks.length);
+		setPromptChunks(p => [...p, ...redoStack.current.pop()]);
+		setUndoHovered(false);
+		return true;
+	}
+
+	const [triggerPredict, setTriggerPredict] = useState(false);
+	const [restartedPredict, setRestartedPredict] = useState(false);
+
+	function undoAndPredict() {
+		if (!undoStack.current.length) return;
+		if (triggerPredict) return;
+		const didUndo = undo();
+		if (didUndo) {
+			setTriggerPredict(true);
+		}
+	}
+
+	function setTitleToSession() {
+		const sessionName = sessionStorage.getProperty('name');
+		document.title = sessionName ? 'mikupad - ' + sessionName : 'mikupad';
+	}
+
+	useEffect(() => {
+		setTitleToSession();
+	}, [sessionStorage]);
+
+	useEffect(() => {
+		if (triggerPredict) {
+			predict();
+			setTriggerPredict(false);
+		}
+	}, [triggerPredict]);
+
+	useLayoutEffect(() => {
+		document.body.style.setProperty('--font-size-multiplier', fontSizeMultiplier);
+	}, [fontSizeMultiplier]);
+
+	useLayoutEffect(() => {
+		if (attachSidebar)
+			document.body.classList.add('attachSidebar');
+		else
+			document.body.classList.remove('attachSidebar');
+	}, [attachSidebar]);
+
+	useLayoutEffect(() => {
+		if (promptAreaWidth) {
+			const container = document.querySelector('#prompt-container');
+			container.style.setProperty('min-width', promptAreaWidth);
+			container.style.setProperty('max-width', promptAreaWidth);
+		}
+	}, [promptAreaWidth]);
+
+	useLayoutEffect(() => {
+		document.documentElement.classList.remove('serif-dark');
+		document.documentElement.classList.remove('monospace-dark');
+		document.documentElement.classList.remove('nockoffAI');
+		document.documentElement.classList.remove('ereader');
+		switch (theme) {
+		case 1:
+			document.documentElement.classList.add('serif-dark');
+			break;
+		case 2:
+			document.documentElement.classList.add('monospace-dark');
+			break;
+		case 3:
+			document.documentElement.classList.add('nockoffAI');
+			break;
+		case 4:
+			document.documentElement.classList.add('ereader');
+			break;
+		}
+	}, [theme]);
+
+
+	useEffect(() => {
+		try {
+			JSON.parse(stoppingStrings);
+			setStoppingStringsError(undefined);
+		} catch (e) {
+			setStoppingStringsError(e.toString());
+		}
+	}, [stoppingStrings]);
+
+	useEffect(() => {
+		try {
+			JSON.parse(drySequenceBreakers);
+			setDrySequenceBreakersError(undefined);
+		} catch (e) {
+			setDrySequenceBreakersError(e.toString());
+		}
+	}, [drySequenceBreakers]);
+
+	useEffect(() => {
+		try {JSON.parse(bannedTokens);
+			setBannedTokensError(undefined);
+		} catch (e) {
+			setBannedTokensError(e.toString());
+		}
+	}, [bannedTokens]);
+
+	useEffect(() => {
+		if (showProbsMode === -1 || tokenHighlightMode === -1)
+			return;
+
+		const adjustProbsPosition = () => {
+			const probsElement = document.getElementById('probs');
+			if (!probsElement) return;
+
+			probsElement.style.display = '';
+			probsElement.style.setProperty('--probs-top', `${currentPromptChunk.top}px`);
+			probsElement.style.setProperty('--probs-left', `${currentPromptChunk.left}px`);
+
+			const probsRect = probsElement.getBoundingClientRect();
+			const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+			const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+			// Adjust left position if element goes off-screen on the right
+			if (probsRect.right > viewportWidth) {
+				const newLeft = viewportWidth - probsRect.width / 2;
+				probsElement.style.setProperty('--probs-left', `${newLeft}px`);
+			}
+
+			// Adjust right position if element goes off-screen on the left
+			if (probsRect.left < 0) {
+				probsElement.style.setProperty('--probs-left', `${probsRect.width / 2}px`);
+			}
+		};
+
+		if (currentPromptChunk && showProbs) {
+			setTimeout(() => {
+				adjustProbsPosition();
+			});
+		}
+	}, [currentPromptChunk, showProbs]);
+
+	// Update the textarea in an uncontrolled way so the user doesn't lose their
+	// selection or cursor position during prediction
+	useLayoutEffect(() => {
+		const elem = promptArea.current;
+		if (elem.value === promptText) {
+			return;
+		} else if (elem.value.length && promptText.startsWith(elem.value)) {
+			const isTextSelected = elem.selectionStart !== elem.selectionEnd;
+			const oldHeight = elem.scrollHeight;
+			const atBottom = (elem.scrollTarget ?? elem.scrollTop) + elem.clientHeight + 1 > oldHeight;
+			const oldLen = elem.value.length;
+			// disable preserveCursorPosition in chatMode
+			if ( (!isTextSelected && !preserveCursorPosition) || (chatMode || useChatAPI)) {
+				elem.value = promptText;
+			} else {
+				elem.setRangeText(promptText.slice(oldLen), oldLen, oldLen, 'preserve');
+			}
+			const newHeight = elem.scrollHeight;
+			if (atBottom && oldHeight !== newHeight) {
+				if (elem.scrollHeight - (elem.scrollTop + elem.clientHeight + 1) >= 100) {
+					// smooth scroll isn't keeping up with prediction speed =(
+					useScrollSmoothing.current = false;
+				}
+				elem.scrollTarget = newHeight - elem.clientHeight;
+				elem.scrollTo({
+					top: newHeight - elem.clientHeight,
+					behavior: useScrollSmoothing.current ? 'smooth' : 'instant',
+				});
+			}
+		} else {
+			elem.value = promptText;
+		}
+	}, [promptText]);
+
+	useLayoutEffect(() => {
+		const elem = promptArea.current;
+		const previewElem = promptPreviewElement.current;
+		if (!elem || !previewElem)
+			return;
+		const oldHeight = elem.scrollHeight;
+		const atBottom = (elem.scrollTarget ?? elem.scrollTop) + elem.clientHeight + 1 > oldHeight;
+		previewElem.textContent = promptPreviewText;
+		elem.style.paddingBottom = previewElem.offsetHeight + 'px';
+		requestAnimationFrame(() => {
+			const newHeight = elem.scrollHeight;
+			if (atBottom && oldHeight !== newHeight) {
+				if (elem.scrollHeight - (elem.scrollTop + elem.clientHeight + 1) >= 100) {
+					// smooth scroll isn't keeping up with prediction speed =(
+					useScrollSmoothing.current = false;
+				}
+				elem.scrollTarget = newHeight - elem.clientHeight;
+				elem.scrollTo({
+					top: newHeight - elem.clientHeight,
+					behavior: useScrollSmoothing.current ? 'smooth' : 'instant',
+				});
+			}
+		});
+	}, [promptPreviewText]);
+
+	useLayoutEffect(() => {
+		if (cancel || promptPreviewText)
+			return;
+		promptArea.current.scrollTarget = undefined;
+		promptArea.current.scrollTop = savedScrollTop;
+		promptOverlay.current.scrollTop = savedScrollTop;
+	}, [savedScrollTop, tokenHighlightMode, showProbsMode]);
+
+	useEffect(() => {
+		if (cancel)
+			return;
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			try {
+				const tokenCount = await getTokenCount({
+					endpoint,
+					endpointAPI,
+					...(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_LLAMA_CPP ? { endpointAPIKey } : {}),
+					content: finalPromptText,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setTokens(tokenCount);
+			} catch (e) {
+				if (e.name !== 'AbortError')
+					reportError(e);
+			}
+		}, 500);
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	}, [modalState["context"], promptText, endpoint, endpointAPI]);
+
+	useEffect(() => {
+		if (endpointAPI !== API_OPENAI_COMPAT && endpointAPI !== API_AI_HORDE) {
+			return;
+		}
+		setRejectedAPIKey(false);
+		const ac = new AbortController();
+		const to = setTimeout(async () => {
+			try {
+				const models = await getModels({
+					endpoint,
+					endpointAPI,
+					endpointAPIKey,
+					signal: ac.signal,
+					...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
+				});
+				setOpenaiModels(models);
+			} catch (e) {
+				if (e.name !== 'AbortError') {
+					reportError(e);
+					const errStr = e.toString();
+					if (endpointAPI == API_OPENAI_COMPAT && errStr.includes("401")) {
+						setRejectedAPIKey(true);
+					}
+				}
+			}
+		}, 500);
+		ac.signal.addEventListener('abort', () => clearTimeout(to));
+		return () => ac.abort();
+	}, [endpoint, endpointAPI, endpointAPIKey]);
+
+	useEffect(() => {
+		function onKeyDown(e) {
+			const { altKey, ctrlKey, shiftKey, key, defaultPrevented } = e;
+			if (defaultPrevented)
+				return;
+			if (Object.values(modalState).some((s) => s))
+				return;
+			switch (`${altKey}:${ctrlKey}:${shiftKey}:${key}`) {
+				case 'false:false:true:Enter':
+				case 'false:true:false:Enter':
+					predict();
+					break;
+				case 'false:false:false:Escape':
+					if (cancel) {
+						cancel();
+					} else if (showPromptPreview && promptPreviewChunks.length !== 0) {
+						setPromptPreviewReroll((r) => r + 1);
+					}
+					break;
+				case 'false:false:false:Tab':
+					if (!showPromptPreview || promptPreviewChunks.length === 0)
+						break;
+
+					setPromptChunks(p => [
+						...p,
+						...promptPreviewChunks
+					]);
+					setTokens(t => t + promptPreviewChunks.length);
+					setPromptPreviewChunks([]);
+					break;
+				case 'false:true:false:r':
+				case 'false:false:true:r':
+					undoAndPredict();
+					break;
+				case 'false:true:false:z':
+				case 'false:false:true:z':
+					if (cancel || !undo()) return;
+					break;
+				case 'false:true:true:Z':
+				case 'false:true:false:y':
+				case 'false:false:true:y':
+					if (cancel || !redo()) return;
+					break;
+
+				default:
+					keyState.current = e;
+					return;
+			}
+			e.preventDefault();
+		}
+		function onKeyUp(e) {
+			const { altKey, ctrlKey, shiftKey, key, defaultPrevented } = e;
+			if (defaultPrevented)
+				return;
+			keyState.current = e;
+		}
+
+		window.addEventListener('keydown', onKeyDown);
+		window.addEventListener('keyup', onKeyUp);
+		return () => {
+			window.removeEventListener('keydown', onKeyDown);
+			window.removeEventListener('keyup', onKeyUp)
+		};
+	}, [predict, cancel]);
+
+	// textarea resize
+	useEffect(() => {
+		const container = document.querySelector('#prompt-container');
+
+		let isDragging = false;
+		let startX;
+		let startMaxWidth;
+		let startEdge;
+		let edgeDetectionZone = 5; // Pixels from edge to trigger resize
+
+		function getNearEdge(e) {
+			const rect = container.getBoundingClientRect();
+			if (e.clientX - rect.left < edgeDetectionZone && e.clientX - rect.left > 0) {
+				return 'left';
+			} else if (rect.right - e.clientX < edgeDetectionZone && rect.right - e.clientX > 0) {
+				return 'right';
+			}
+			return false;
+		}
+
+		function startDragging(e) {
+			const edge = getNearEdge(e);
+			if (!edge) return; // Only drag from edges
+
+			// reset selection
+			promptArea.current.selectionStart = promptArea.current.selectionEnd;
+
+			isDragging = true;
+
+			const invEdgePos = edge == 'right' ? container.getBoundingClientRect().left : container.getBoundingClientRect().right;
+			startX = e.clientX - invEdgePos;
+			startMaxWidth = getComputedStyle(container).getPropertyValue('max-width');
+			startEdge = edge;
+		}
+
+		function drag(e) {
+			switch (getNearEdge(e)) {
+				case 'right':
+					promptArea.current.style.cursor = 'col-resize';
+					container.style.cursor = 'col-resize';
+					container.style.borderRight = '2px dotted var(--color-light)';
+					break;
+				case 'left':
+					promptArea.current.style.cursor = 'col-resize';
+					container.style.cursor = 'col-resize';
+					container.style.borderLeft = '2px dotted var(--color-light)';
+					break;
+				default:
+					promptArea.current.style.cursor = '';
+					container.style.cursor = '';
+					container.style.borderRight = '2px dotted transparent';
+					container.style.borderLeft = '2px dotted transparent';
+					break;
+			}
+
+			if (!isDragging) return;
+
+			// reset selection
+			promptArea.current.selectionStart = promptArea.current.selectionEnd;
+
+			const invEdgePos = startEdge == 'right' ? container.getBoundingClientRect().left : container.getBoundingClientRect().right;
+			const currentX = e.clientX - invEdgePos;
+			setPromptAreaWidth(`calc(${startMaxWidth} + ${(currentX - startX) * (startEdge == 'right' ? 1 : -1)}px)`);
+		}
+
+		function stopDragging() {
+			isDragging = false;
+		}
+
+		container.addEventListener('mousedown', startDragging);
+		document.addEventListener('mousemove', drag);
+		document.addEventListener('mouseup', stopDragging);
+		document.addEventListener('mouseleave', stopDragging);
+		return () => {
+			container.removeEventListener('mousedown', startDragging);
+			document.removeEventListener('mousemove', drag);
+			document.removeEventListener('mouseup', stopDragging);
+			document.removeEventListener('mouseleave', stopDragging);
+		};
+	}, []);
+
+	function onInput({ target }) {
+		setPromptChunks(oldPrompt => {
+			const start = [];
+			const end = [];
+			const oldPromptLength = oldPrompt.length;
+			oldPrompt = [...oldPrompt];
+			let newValue = target.value;
+
+			while (oldPrompt.length) {
+				const chunk = oldPrompt[0];
+				if (!newValue.startsWith(chunk.content))
+					break;
+				oldPrompt.shift();
+				start.push(chunk);
+				newValue = newValue.slice(chunk.content.length);
+			}
+
+			while (oldPrompt.length) {
+				const chunk = oldPrompt.at(-1);
+				if (!newValue.endsWith(chunk.content))
+					break;
+				oldPrompt.pop();
+				end.unshift(chunk);
+				newValue = newValue.slice(0, -chunk.content.length);
+			}
+
+			// Merge chunks if they're from the user
+			let mergeUserChunks = (chunks, newContent) => {
+				let lastChunk = chunks[chunks.length - 1];
+				while (lastChunk && lastChunk.type === 'user') {
+					lastChunk.content += newContent;
+					if (chunks[chunks.length - 2] && chunks[chunks.length - 2].type === 'user') {
+						newContent = lastChunk.content;
+						lastChunk = chunks[chunks.length - 2];
+						chunks.splice(chunks.length - 1, 1);
+					} else {
+						return chunks;
+					}
+				}
+				return [...chunks, { type: 'user', content: newContent }];
+			};
+
+			let newPrompt = [...start];
+			if (newValue) {
+				newPrompt = mergeUserChunks(newPrompt, newValue);
+			}
+			if (end.length && end[0].type === 'user') {
+				newPrompt = mergeUserChunks(newPrompt, end.shift().content);
+			}
+			newPrompt.push(...end);
+
+			// Remove all undo positions within the modified range.
+			undoStack.current = undoStack.current.filter(pos => pos > start.length && pos < newPrompt.length);
+			if (!undoStack.current.length)
+				setUndoHovered(false);
+
+			// Adjust undo/redo stacks.
+			const chunkDifference = oldPromptLength - newPrompt.length;
+			undoStack.current = undoStack.current.map(pos => {
+				if (pos >= start.length) {
+					return pos - chunkDifference;
+				}
+				return pos;
+			});
+
+			// Reset redo stack if a new chunk is added/removed at the end.
+			if (chunkDifference < 0 && !end.length) {
+				redoStack.current = [];
+			}
+
+			return newPrompt;
+		});
+	}
+
+	function onScroll({ target }) {
+		if (target.scrollTop === target.scrollTarget)
+			target.scrollTarget = undefined;
+
+		const newTop = target.scrollTop;
+		const oldTop = promptOverlay.current.scrollTop;
+
+		if (newTop < oldTop) {
+			// user scrolled up
+			target.scrollTarget = undefined;
+		}
+
+		promptOverlay.current.scrollTop = target.scrollTop;
+		promptOverlay.current.scrollLeft = target.scrollLeft;
+		setSavedScrollTop(newTop);
+
+		if (showProbsMode !== -1) {
+			const probsElement = document.getElementById('probs');
+			if (probsElement) {
+				const probsTop = getComputedStyle(probsElement).getPropertyValue('top');
+				probsElement.style.setProperty('--probs-top', `calc(${probsTop} + ${oldTop - newTop}px)`);
+			} else if (currentPromptChunk) {
+				currentPromptChunk.top += oldTop - newTop;
+			}
+		}
+	}
+
+	function onContextMenu(event) {
+		if (event.ctrlKey) {
+			event.preventDefault();
+			if (cancel)
+				return;
+			setContextMenuState({
+				visible: true,
+				x: event.pageX,
+				y: event.pageY,
+			});
+		}
+	}
+
+	function onPromptMouseMove({ clientX, clientY }) {
+		if (showProbsMode === -1 && tokenHighlightMode === -1)
+			return;
+		promptOverlay.current.style.pointerEvents = 'auto';
+		const elem = document.elementFromPoint(clientX, clientY);
+		const pc = elem?.closest?.('[data-promptchunk]');
+		const probs = elem?.closest?.('#probs');
+		promptOverlay.current.style.pointerEvents = 'none';
+		if (probs)
+			return;
+		if (!pc) {
+			setCurrentPromptChunk(undefined);
+			return;
+		}
+		const rect = [...pc.getClientRects()].at(-1);
+		const index = +pc.dataset.promptchunk;
+		const top = rect.top;
+		const left = rect.x + rect.width / 2;
+		setCurrentPromptChunk(cur => {
+			const isCurrent = cur && cur.index === index && cur.top === top && cur.left === left;
+			switch (showProbsMode) {
+				case 0:
+					if (!isCurrent || !showProbs) {
+						setShowProbs(false);
+						clearTimeout(probsDelayTimer.current);
+						probsDelayTimer.current = setTimeout(() => setShowProbs(true), 300);
+					}
+					break;
+				case 1:
+					setShowProbs(keyState.current.ctrlKey);
+			}
+			return isCurrent ? cur : { index, top, left };
+		});
+	}
+
+	async function switchCompletion(i, tok) {
+		const remainingPrompt = promptChunks.slice(i);
+		if (remainingPrompt.some((chunk) => chunk.type === 'user')) {
+			// disallow switching tokens in FIM.
+			return;
+		}
+
+		const newPrompt = [
+			...promptChunks.slice(0, i),
+			{
+				...promptChunks[i],
+				content: tok.tok_str,
+				prob: tok.prob
+			},
+		];
+		setPromptChunks(newPrompt);
+		setTriggerPredict(true);
+		setRestartedPredict(true);
+	}
+
+	function switchEndpointAPI(value) {
+		let url;
+		try {
+			url = new URL(endpoint);
+		} catch {
+			return;
+		}
+		switch (value) {
+			case API_LLAMA_CPP:
+				setUseChatAPI(false);
+				if (url.protocol != 'http:' && url.protocol != 'https:')
+					url.protocol = "http:";
+				url.port = 8080;
+				break;
+			case API_KOBOLD_CPP:
+				setUseChatAPI(false);
+				if (url.protocol != 'http:' && url.protocol != 'https:')
+					url.protocol = "http:";
+				url.port = 5001;
+				break;
+			case API_OPENAI_COMPAT:
+				if (url.protocol != 'http:' && url.protocol != 'https:')
+					url.protocol = "http:";
+				break;
+			case API_AI_HORDE:
+				setUseChatAPI(false);
+				break;
+		}
+		setEndpoint(url.toString());
+		setEndpointAPI(value);
+	}
+
+	function isMixedContent() {
+		const isHttps = window.location.protocol == 'https:';
+		let url;
+		try {
+			url = new URL(endpointAPI != API_AI_HORDE ? endpoint : 'https://aihorde.net/api');
+		} catch {
+			return false;
+		}
+		return isHttps && (url.protocol !== 'https:' && url.protocol !== 'wss:');
+	}
+
+	useEffect(() => {
+		function onSessionChange() {
+			redoStack.current = [];
+			undoStack.current = [];
+			setUndoHovered(false);
+			setPromptPreviewChunks([]);
+			setTitleToSession();
+		}
+		function onSessionError() {
+			if (!sessionReconnectTimer.current) {
+				sessionReconnectTimer.current = setInterval(async () => {
+					try {
+						await sessionStorage.dbAdapter.init();
+						setSessionEndpointError(undefined);
+						clearTimeout(sessionReconnectTimer.current);
+						sessionReconnectTimer.current = undefined;
+					} catch (e) {
+						reportError(e);
+					}
+				}, 1000);
+			}
+			setSessionEndpointError("Mikupad server is unreachable!");
+			setCurrentPromptChunk(undefined);
+			setUndoHovered(false);
+		}
+
+		sessionStorage.addEventListener('sessionchange', onSessionChange);
+		sessionStorage.addEventListener('error', onSessionError);
+		return () => {
+			sessionStorage.removeEventListener('sessionchange', onSessionChange);
+			sessionStorage.removeEventListener('error', onSessionError);
+		};
+	}, []);
+
+	const probs = useMemo(() =>
+		showProbs && promptChunks[currentPromptChunk?.index]?.completion_probabilities?.[0]?.probs,
+		[promptChunks, currentPromptChunk, showProbs]);
+
+	const sidebar = useRef(null);
+	const [sidebarHeight, setSidebarHeight] = useState(0);
+	const [isMobile, setIsMobile] = useState(false);
+	useEffect(() => {
+		setSidebarHeight(sidebar.current.scrollHeight);
+		const observer = new SVResizeObserver(() => {
+			setIsMobile(window.innerWidth < 767.8);
+			setSidebarHeight(sidebar.current.scrollHeight);
+		});
+		observer.observe(sidebar.current);
+		return () => observer.disconnect();
+	}, []);
+
+	// handle instruct modal result
+	useEffect(() => {
+		const result = instructModalState.result;
+		if (!result)
+			return;
+		
+		const elem = promptArea.current;
+		if (!elem)
+			return;
+
+		const startPos = instructModalState.selectionStart;
+		const endPos = instructModalState.selectionEnd;
+		const textBefore = elem.value.substring(0, startPos) || "";
+		const textAfter = elem.value.substring(endPos);
+		const selectedText = elem.value.substring(startPos, endPos);
+
+		const finalText = textBefore 
+					+ (result.replace ? (result.content) : (result.content + selectedText))
+					+ textAfter;
+
+		const scrollTop = elem.scrollTop;
+
+		elem.value = finalText;
+
+		let newCursorPos;
+		if (result.replace) {
+			newCursorPos = startPos + result.content.length;
+		} else {
+			newCursorPos = startPos + result.content.length + selectedText.length;
+		}
+		elem.focus();
+		elem.setSelectionRange(newCursorPos, newCursorPos);
+		onInput({ target: elem });
+
+		elem.scrollTop = scrollTop;
+	}, [instructModalState.result]);
+
+	return html`
+		<div id="prompt-container" onMouseMove=${onPromptMouseMove} style=${{ 'margin-bottom': isMobile ? sidebarHeight + 'px' : 0 }}>
+			<button
+				title="Editor Preferences"
+				className="textAreaSettings"
+				onClick=${() => toggleModal("prompt")}>
+				<${SVG_Settings}/>
+			</button>
+			<button
+				title="Search & Replace"
+				style=${{"margin-top":"1.5em"}}
+				className="textAreaSettings"
+				onClick=${() => toggleModal("searchAndReplace")}>
+				<${SVG_SearchAndReplace} style=${{"height":"1.3em"}} />
+			</button>
+			<textarea
+				ref=${promptArea}
+				readOnly=${!!cancel}
+				spellCheck=${spellCheck}
+				id="prompt-area"
+				onInput=${onInput}
+				onScroll=${onScroll}
+				onContextMenu=${onContextMenu}
+				...${showPromptPreview && { style: { 'padding-bottom': promptPreviewElement.current?.offsetHeight ?? '0px' } }}/>
+			<div
+				ref=${promptOverlay}
+				id="prompt-overlay"
+				aria-hidden
+				...${showPromptPreview && { style: { 'padding-bottom': promptPreviewElement.current?.offsetHeight ?? '0px' } }}>
+				${tokenHighlightMode !== -1 ? html`
+					${promptChunks.map((chunk, i) => {
+						const getRatioColor = (ratio) => {
+							const sRatio = Math.max(0, Math.min(1, ratio));
+							if (sRatio <= 0.5) {
+								// Scale ratio from [0, 0.5] to [0, 1]
+								const adjustedRatio = sRatio / 0.5;
+								return `color-mix(in srgb, red ${100 - adjustedRatio * 100}%, yellow ${adjustedRatio * 100}%)`;
+							} else {
+								// Scale ratio from [0.5, 1] to [0, 1]
+								const adjustedRatio = (sRatio - 0.5) / 0.5;
+								return `color-mix(in srgb, yellow ${100 - adjustedRatio * 100}%, var(--color-miku) ${adjustedRatio * 100}%)`;
+							}
+						};
+						const chunkProb = chunk.prob ?? 1;
+						let bgColor = "";
+						if (tokenColorMode === 1 && chunkProb < 1) {
+							bgColor = getRatioColor(chunkProb);
+						} else if (tokenColorMode === 2 && chunkProb < 1) {
+							const chunkProbs = chunk.completion_probabilities?.[0]?.probs ?? [];
+							const minChunkProb = chunkProbs.length < 10 ? Math.min(...chunkProbs.map(p => p.prob)) : 0;
+							const maxChunkProb = chunkProbs.length > 0 ? Math.max(...chunkProbs.map(p => p.prob)) : 1;
+							bgColor = getRatioColor((chunkProb - minChunkProb) / (maxChunkProb - minChunkProb));
+						}
+						const isCurrent = currentPromptChunk && currentPromptChunk.index === i;
+						const isNextUndo = undoHovered && !!undoStack.current.length && undoStack.current.at(-1) <= i;
+						return html`
+							<span
+								key=${i}
+								data-promptchunk=${i}
+								style=${bgColor ? { '--bg-color': bgColor } : {}}
+								className=${`${(tokenHighlightMode === 1 && !isCurrent) || chunk.type === 'user' ? 'user' : 'machine'} ${isCurrent ? 'current' : ''} ${isNextUndo ? 'erase' : ''}`}>
+								${(chunk.content === '\n' ? ' \n' : chunk.content) + (i === promptChunks.length - 1 && chunk.content.endsWith('\n') && promptPreviewChunks.length === 0 ? '\u00a0' : '')}
+							</span>`;
+					})}
+					${(showPromptPreview && promptPreviewChunks.length) ? html`
+						<span ref=${promptPreviewElement} className="preview"></span>
+						<span class="preview nudge">Tab</span>` : null}` : null}
+			</div>
+			<${SearchAndReplaceWidget}
+				isOpen=${modalState.searchAndReplace}
+				closeWidget=${() => closeModal("searchAndReplace")}
+				id="searchAndReplace"
+				promptArea=${promptArea}
+				promptText=${promptText}
+				cancel=${cancel}/>
+		</div>
+		${probs ? html`
+			<div
+				id="probs"
+				style=${{
+					'display': 'none'
+				}}>
+				${probs.filter(prob => prob.prob > 0).map((prob, i) => {
+					const index = currentPromptChunk?.index;
+					const isCurrentToken = promptChunks[index]?.prob == prob.prob;
+					return html`<button key=${i} className=${isCurrentToken ? 'current' : ''} onClick=${() => switchCompletion(index, prob)}>
+						<div className="tok">${replaceUnprintableBytes(prob.tok_str.replaceAll(' ', '␣').replaceAll('\t', '⇥').replaceAll('\n', '↵'))}</div>
+						<div className="prob">${(prob.prob * 100).toFixed(2)}%</div>
+					</button>`;
+				})}
+			</div>` : null}
+		<div id="sidebar" ref=${sidebar} style=${{ 'max-height': ''}}>
+			<${SelectBox}
+				label="Theme"
+				value=${theme}
+				onValueChange=${setTheme}
+				options=${[
+					{ name: 'Serif Light', value: 0 },
+					{ name: 'Serif Dark', value: 1 },
+					{ name: 'Monospace Dark', value: 2 },
+					{ name: 'nockoffAI', value: 3 },
+					{ name: 'eReader', value: 4 },
+				]}/>
+			<div class="horz-separator"/>
+			<${CollapsibleGroup} label="Sessions">
+				<${Sessions} sessionStorage=${sessionStorage} disabled=${!!cancel}/>
+			</${CollapsibleGroup}>
+			<${CollapsibleGroup} label="Parameters" expanded>
+				<${InputBox} label="Server"
+					className="${isMixedContent() ? 'mixed-content' : ''}"
+					tooltip="${isMixedContent() ? 'This URL might be blocked due to mixed content. If the prediction fails, download mikupad.html and run it locally.' : ''}"
+					readOnly=${!!cancel || endpointAPI == API_AI_HORDE}
+					value=${endpointAPI != API_AI_HORDE ? endpoint : 'https://aihorde.net/api'}
+					onValueChange=${setEndpoint}/>
+				<${SelectBox}
+					label="API"
+					disabled=${!!cancel}
+					value=${endpointAPI}
+					onValueChange=${switchEndpointAPI}
+					options=${[
+						{ name: 'llama.cpp'        , value: API_LLAMA_CPP },
+						{ name: 'KoboldCpp'        , value: API_KOBOLD_CPP },
+						{ name: 'OpenAI Compatible', value: API_OPENAI_COMPAT },
+						{ name: 'AI Horde'         , value: API_AI_HORDE },
+					]}/>
+				<div className="hbox-flex" style=${{"flex-wrap": "unset"}}>
+					<${InputBox} label="API Key" type="${!showAPIKey ? "password" : "text"}"
+						className="${rejectedAPIKey ? 'rejected' : ''}"
+						tooltip="${rejectedAPIKey ? 'This API Key was rejected by the backend.' : ''}"
+						tooltipSize="short"
+						readOnly=${!!cancel}
+						value=${endpointAPIKey}
+						onValueChange=${setEndpointAPIKey}/>
+					<button title="${!showAPIKey ? "Show API Key" : "Hide API Key"}"
+						className="eye-button"
+						disabled=${!!cancel}
+						onClick=${() => setShowAPIKey(!showAPIKey)}>
+						${!showAPIKey ? html`<${SVG_ShowKey}/>`
+										: html`<${SVG_HideKey}/>`}
+					</button>
+				</div>
+				${(endpointAPI == API_OPENAI_COMPAT || endpointAPI == API_AI_HORDE) && html`
+					<${InputBox} label="Model"
+						datalist=${openaiModels}
+						readOnly=${!!cancel}
+						value=${endpointModel}
+						onValueChange=${setEndpointModel}/>`}
+				${endpointAPI != API_AI_HORDE && html`
+					${endpointAPI == API_OPENAI_COMPAT && html`
+						<${Checkbox} label="Strict API"
+							title="If enabled, non-standard fields won't be included in API requests."
+							disabled=${!!cancel} value=${openaiPresets} onValueChange=${setOpenaiPresets}/>
+						<${Checkbox} label="Chat Completions API"
+							title="If enabled, the chat API endpoint will be used, and the prompt will be split into chat messages based on the delimiters defined in the selected instruct template."
+							disabled=${!!cancel} value=${useChatAPI} onValueChange=${setUseChatAPI}/>`}
+					<${Checkbox} label="Token Streaming"
+						disabled=${!!cancel} value=${useTokenStreaming} onValueChange=${setUseTokenStreaming}/>
+					<${Checkbox} label="Prediction Preview"
+						disabled=${!!cancel || tokenHighlightMode === -1} value=${showPromptPreview && tokenHighlightMode !== -1} onValueChange=${setShowPromptPreview}/>
+					${showPromptPreview && html`
+						<${InputBox} label="Max Preview Tokens" type="text" inputmode="numeric"
+							readOnly=${!!cancel} value=${promptPreviewTokens} onValueChange=${setPromptPreviewTokens}/>`}`}
+				<div className="buttons instructTemplateSidebar">
+					<${SelectBoxTemplate}
+						label="Instruct Template"
+						disabled=${!!cancel}
+						value=${selectedTemplate}
+						onValueChange=${setSelectedTemplate}
+						options=${templateList}/>
+					<button
+						title="Edit Instruct Templates"
+						disabled=${!!cancel}
+						class="symbol-button"
+						onClick=${() => toggleModal("instructTemplates")}>
+						<${SVG_Settings} style=${{ 'width':'.95em','transform':'translate(-50%, -45%)' }}/>
+					</button>
+					<button
+						title="Insert System Prompt Template"
+						disabled=${!!cancel}
+						class="symbol-button"
+						onClick=${() => insertTemplate("sys")}>
+						<${SVG_SysPrompt} style=${{ 'width':'.9em' }}/>
+					</button>
+					<button
+						title="Insert Instruct Template"
+						disabled=${!!cancel}
+						class="symbol-button"
+						onClick=${() => insertTemplate("inst")}>
+						<${SVG_instTemplate} style=${{ 'height':'1.05em','transform':'translate(-50%, -60%)' }}/>
+					</button>
+					<button
+						title="Toggle Chat Mode ${ chatMode ? "Off" : "On"}"
+						disabled=${!!cancel || useChatAPI}
+						class="symbol-button"
+						onClick=${() => setChatMode( (prevState) => !prevState)}>
+						${ (chatMode || useChatAPI) ? 
+							html`<${SVG_ChatMode} style=${{ 'width':'.9em' }} />` :
+							html`<${SVG_CompletionMode} style=${{ 'width':'1.05em' }} />`
+						}
+					</button>
+				</div>
+				<${InputBox} label="Seed (-1 = random)" type="text" inputmode="numeric"
+					readOnly=${!!cancel} value=${seed} onValueChange=${setSeed}/>
+				<${InputBox} tooltip="Currently not accurate to the token count, it will be used as an estimate." label="Max Context Length" type="text" inputmode="numeric"
+					readOnly=${!!cancel} value=${contextLength} onValueChange=${setContextLength}/>
+				<${InputBox} label="Max Predict Tokens${endpointAPI != API_LLAMA_CPP ? (endpointAPI == API_AI_HORDE ? ' (-1 = 512)' : ' (-1 = 1024)') : ' (-1 = infinite)'}" type="text" inputmode="numeric"
+					readOnly=${!!cancel} value=${maxPredictTokens} onValueChange=${setMaxPredictTokens}/>
+				<${InputBox} label="Stopping Strings (JSON array)" type="text" pattern="^\\[.*?\\]$"
+					className="${stoppingStringsError ? 'rejected' : ''}"
+					tooltip="${stoppingStringsError ? stoppingStringsError : ''}"
+					readOnly=${!!cancel}
+					value=${stoppingStrings}
+					onValueChange=${setStoppingStrings}/>
+			</${CollapsibleGroup}>
+			<${CollapsibleGroup} label="Sampling" expanded menu=${html`
+					<${Checkbox} label="Temperature"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('temperature')}
+						onValueChange=${(v) => enabledSamplers.indexOf('temperature') === -1
+											  ? setEnabledSamplers((es) => [...es, 'temperature'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'temperature'))}/>
+					<${Checkbox} label="Dynamic Temperature"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('dynatemp')}
+						onValueChange=${(v) => enabledSamplers.indexOf('dynatemp') === -1
+											  ? setEnabledSamplers((es) => [...es, 'dynatemp'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'dynatemp'))}/>
+					<${Checkbox} label="Repetition Penalty"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('rep_pen')}
+						onValueChange=${(v) => enabledSamplers.indexOf('rep_pen') === -1
+											  ? setEnabledSamplers((es) => [...es, 'rep_pen'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'rep_pen'))}/>
+					<${Checkbox} label="Presence Penalty"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('pres_pen')}
+						onValueChange=${(v) => enabledSamplers.indexOf('pres_pen') === -1
+											  ? setEnabledSamplers((es) => [...es, 'pres_pen'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'pres_pen'))}/>
+					<${Checkbox} label="Frequence Penalty"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('freq_pen')}
+						onValueChange=${(v) => enabledSamplers.indexOf('freq_pen') === -1
+											  ? setEnabledSamplers((es) => [...es, 'freq_pen'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'freq_pen'))}/>
+					<${Checkbox} label="Mirostat"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('mirostat')}
+						onValueChange=${(v) => enabledSamplers.indexOf('mirostat') === -1
+											  ? setEnabledSamplers((es) => [...es, 'mirostat'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'mirostat'))}/>
+					<${Checkbox} label="XTC"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('xtc')}
+						onValueChange=${(v) => enabledSamplers.indexOf('xtc') === -1
+											  ? setEnabledSamplers((es) => [...es, 'xtc'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'xtc'))}/>
+					<${Checkbox} label="DRY"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('dry')}
+						onValueChange=${(v) => enabledSamplers.indexOf('dry') === -1
+											  ? setEnabledSamplers((es) => [...es, 'dry'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'dry'))}/>
+					<${Checkbox} label="Top K"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('top_k')}
+						onValueChange=${(v) => enabledSamplers.indexOf('top_k') === -1
+											  ? setEnabledSamplers((es) => [...es, 'top_k'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'top_k'))}/>
+					<${Checkbox} label="Top P"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('top_p')}
+						onValueChange=${(v) => enabledSamplers.indexOf('top_p') === -1
+											  ? setEnabledSamplers((es) => [...es, 'top_p'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'top_p'))}/>
+					<${Checkbox} label="Min P"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('min_p')}
+						onValueChange=${(v) => enabledSamplers.indexOf('min_p') === -1
+											  ? setEnabledSamplers((es) => [...es, 'min_p'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'min_p'))}/>
+					<${Checkbox} label="Typical P"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('typical_p')}
+						onValueChange=${(v) => enabledSamplers.indexOf('typical_p') === -1
+											  ? setEnabledSamplers((es) => [...es, 'typical_p'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'typical_p'))}/>
+					<${Checkbox} label="TFS z"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('tfs_z')}
+						onValueChange=${(v) => enabledSamplers.indexOf('tfs_z') === -1
+											  ? setEnabledSamplers((es) => [...es, 'tfs_z'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'tfs_z'))}/>
+					<${Checkbox} label="Banned Strings"
+						disabled=${!!cancel}
+						value=${enabledSamplers.includes('ban_tokens')}
+						onValueChange=${(v) => enabledSamplers.indexOf('ban_tokens') === -1
+											  ? setEnabledSamplers((es) => [...es, 'ban_tokens'])
+											  : setEnabledSamplers((es) => es.filter((s) => s !== 'ban_tokens'))}/>
+				`}>
+				<${InputSlider} label="Temperature" type="number" step="0.01" max="5"
+					hidden=${!enabledSamplers.includes('temperature')}
+					readOnly=${!!cancel} value=${temperature} onValueChange=${setTemperature}/>
+				${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+					${enabledSamplers.includes('dynatemp') && html`
+						<div className="hbox">
+							<${InputSlider} label="DynaTemp Range" type="number" step="0.01"
+								readOnly=${!!cancel} value=${dynaTempRange} onValueChange=${setDynaTempRange}/>
+							${(endpointAPI != API_KOBOLD_CPP && endpointAPI != API_AI_HORDE) && html`
+								<${InputSlider} label="DynaTemp Exp" type="number" step="0.01"
+									readOnly=${!!cancel} value=${dynaTempExp} onValueChange=${setDynaTempExp}/>`}
+						</div>`}
+					${enabledSamplers.includes('rep_pen') && html`
+						<div className="hbox">
+							<${InputSlider} label="Repeat Penalty" type="number" step="0.01" min="1" max="3"
+								readOnly=${!!cancel} value=${repeatPenalty} onValueChange=${setRepeatPenalty}/>
+							<${InputSlider} label="Rep Pen Range" type="number" step="1" max="${contextLength}"
+								readOnly=${!!cancel} value=${repeatLastN} onValueChange=${setRepeatLastN}/>
+						</div>
+						<${Checkbox} label="Penalize NL"
+							disabled=${!!cancel} value=${penalizeNl} onValueChange=${setPenalizeNl}/>`}
+					`}
+				${(enabledSamplers.includes('pres_pen') || enabledSamplers.includes('freq_pen')) && html`
+					<div className="hbox">
+						<${InputSlider} label="Pres. Penalty" type="number" step="0.01" min="-2" max="2"
+							hidden=${!enabledSamplers.includes('pres_pen')}
+							readOnly=${!!cancel} value=${presencePenalty} onValueChange=${setPresencePenalty}/>
+						<${InputSlider} label="Freq. Penalty" type="number" step="0.01" min="-2" max="2"
+							hidden=${!enabledSamplers.includes('freq_pen')}
+							readOnly=${!!cancel} value=${frequencyPenalty} onValueChange=${setFrequencyPenalty}/>
+					</div>`}
+				${temperature <= 0 ? null : html`
+					${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+						<${SelectBox}
+							label="Mirostat"
+							disabled=${!!cancel}
+							hidden=${!enabledSamplers.includes('mirostat')}
+							value=${mirostat}
+							onValueChange=${setMirostat}
+							options=${[
+								{ name: 'Off', value: 0 },
+								{ name: 'Mirostat', value: 1 },
+								{ name: 'Mirostat 2.0', value: 2 },
+							]}/>`}
+					${(enabledSamplers.includes('mirostat') && mirostat && (!openaiPresets || endpointAPI != API_OPENAI_COMPAT)) ? html`
+						<div className="hbox">
+							<${InputSlider} label="Mirostat τ" type="number" step="0.01" max="20"
+								readOnly=${!!cancel} value=${mirostatTau} onValueChange=${setMirostatTau}/>
+							<${InputSlider} label="Mirostat η" type="number" step="0.01" max="1"
+								readOnly=${!!cancel} value=${mirostatEta} onValueChange=${setMirostatEta}/>
+						</div>
+					` : html`
+						${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+							${enabledSamplers.includes('xtc') && html`
+								<div className="hbox">
+									<${InputSlider} label="XTC Threshold" type="number" step="0.01" max="0.5"
+										readOnly=${!!cancel} value=${xtcThreshold} onValueChange=${setXtcThreshold}/>
+									<${InputSlider} label="XTC Probability" type="number" step="0.01" max="1"
+										readOnly=${!!cancel} value=${xtcProbability} onValueChange=${setXtcProbability}/>
+								</div>`}
+							${enabledSamplers.includes('dry') && html`
+								<div className="hbox">
+									<${InputSlider} label="DRY Multip." type="number" step="0.01" max="5"
+										readOnly=${!!cancel} value=${dryMultiplier} onValueChange=${setDryMultiplier}/>
+									<${InputSlider} label=${html`<br/>Base`} type="number" step="0.01" min="1" max="4"
+										readOnly=${!!cancel} value=${dryBase} onValueChange=${setDryBase}/>
+									<${InputSlider} label="Allowed Length" type="number" step="1" max="20"
+										readOnly=${!!cancel} value=${dryAllowedLength} onValueChange=${setDryAllowedLength}/>
+									<${InputSlider} label="Penalty Range" type="number" step="1" max="${contextLength}"
+										readOnly=${!!cancel} value=${dryPenaltyRange} onValueChange=${setDryPenaltyRange}/>
+								</div>
+								<${InputBox} label="DRY Sequence Breakers (JSON array)" type="text" pattern="^\\[.*?\\]$"
+									className="${drySequenceBreakersError ? 'rejected' : ''}"
+									tooltip="${drySequenceBreakersError ? drySequenceBreakersError : ''}"
+									readOnly=${!!cancel}
+									value=${drySequenceBreakers}
+									onValueChange=${setDrySequenceBreakers}/>`}
+						`}
+						${(enabledSamplers.includes('top_k') || enabledSamplers.includes('top_p') || enabledSamplers.includes('min_p')) && html`
+							<div className="hbox">
+								${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+									<${InputSlider} label="Top K" type="number" step="1" max="200"
+										hidden=${!enabledSamplers.includes('top_k')}
+										readOnly=${!!cancel} value=${topK} onValueChange=${setTopK}/>`}
+								<${InputSlider} label="Top P" type="number" step="0.01" max="1"
+									hidden=${!enabledSamplers.includes('top_p')}
+									readOnly=${!!cancel} value=${topP} onValueChange=${setTopP}/>
+								${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+									<${InputSlider} label="Min P" type="number" step="0.01" max="1"
+										hidden=${!enabledSamplers.includes('min_p')}
+										readOnly=${!!cancel} value=${minP} onValueChange=${setMinP}/>`}
+							</div>`}
+						${((enabledSamplers.includes('typical_p') || enabledSamplers.includes('tfs_z')) && (!openaiPresets || endpointAPI != API_OPENAI_COMPAT)) && html`
+							<div className="hbox">
+								<${InputSlider} label="Typical P" type="number" step="0.01" max="1"
+									hidden=${!enabledSamplers.includes('typical_p')}
+									readOnly=${!!cancel} value=${typicalP} onValueChange=${setTypicalP}/>
+								<${InputSlider} label="TFS z" type="number" step="0.01" max="1"
+									hidden=${!enabledSamplers.includes('tfs_z')}
+									readOnly=${!!cancel} value=${tfsZ} onValueChange=${setTfsZ}/>
+							</div>`}
+					`}
+				`}
+				${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+					${enabledSamplers.includes('ban_tokens') && html`
+						<${InputBox} label="Banned Strings (JSON array)" type="text" pattern="^\\[.*?\\]$"
+							className="${bannedTokensError ? 'rejected' : ''}"
+							tooltip="${bannedTokensError ? bannedTokensError : ''}"
+							readOnly=${!!cancel}
+							value=${bannedTokens}
+							onValueChange=${setBannedTokens}/>`}
+					<button
+						disabled=${!!cancel}
+						onClick=${() => toggleModal("grammar")}>
+						Grammar
+						</button>`}
+				<button
+					disabled=${!!cancel}
+					onClick=${() => toggleModal("bias")}>
+					Logit Bias
+					</button>
+				${(!openaiPresets || endpointAPI != API_OPENAI_COMPAT) && html`
+					<${Checkbox} label="Ignore <eos>"
+						disabled=${!!cancel} value=${ignoreEos} onValueChange=${setIgnoreEos}/>`}
+
+
+			</${CollapsibleGroup}>
+			<${CollapsibleGroup} label="Persistent Context">
+				<label className="TextArea">
+					<div>Memory ${memoryTokens.tokens > 0 ? html`<small>(${memoryTokens.tokens} Tokens)</small>`:""}</div>
+					<textarea
+					readOnly=${!!cancel}
+					placeholder="Anything written here will be injected at the head of the prompt. Tokens here DO count towards the Context Limit."
+					defaultValue=${memoryTokens.text}
+					value=${memoryTokens.text}
+					onInput=${(e) => handleMemoryTokensChange("text", e.target.value) }
+					id="memory-area"/>
+					<button
+					className="textAreaSettings"
+					disabled=${!!cancel}
+					onClick=${() => toggleModal("memory")}>
+						<${SVG_Settings}/>
+					</button>
+				</label>
+				<label className="TextArea">
+					<div>Author's Note ${authorNoteTokens.tokens > 0 ? html`<small>(${authorNoteTokens.tokens} Tokens)</small>`:""}</div>
+					<textarea
+					readOnly=${!!cancel}
+					placeholder="Anything written here will be injected ${authorNoteDepth} newlines from bottom into context."
+					defaultValue=${authorNoteTokens.text}
+					value=${authorNoteTokens.text}
+					onInput=${(e) => handleauthorNoteTokensChange("text", e.target.value) }
+					id="an-area"/>
+					<button
+					className="textAreaSettings"
+					disabled=${!!cancel}
+					onClick=${() => toggleModal("an")}>
+						<${SVG_Settings}/>
+					</button>
+				</label>
+				<button
+					id="viewWorldInfo"
+					disabled=${!!cancel}
+					onClick=${() => toggleModal("wi")}>
+					Show World Info
+				</button>
+				<button
+					id="viewContext"
+					disabled=${!!cancel}
+					onClick=${() => toggleModal("context")}>
+					Show Context
+				</button>
+
+			</${CollapsibleGroup}>
+			${!!tokens && html`
+				<${InputBox} label="Tokens" value="${tokens}${tokensPerSec ? ` (${tokensPerSec.toFixed(2)} T/s)` : ``}" readOnly/>`}
+			${!!hordeQueuePos && html`
+				<${InputBox} label="Queue Position" value="${hordeQueuePos}" readOnly/>`}
+			<div className="buttons">
+				<button
+					title="Run next prediction (Ctrl + Enter)"
+					className=${cancel && !sessionEndpointConnecting ? ((predictStartTokens === tokens && (endpointAPI != API_AI_HORDE || !hordeProcessing)) ? 'processing' : 'completing') : ''}
+					disabled=${!!cancel || stoppingStringsError || drySequenceBreakersError || bannedTokensError}
+					onClick=${() => predict()}>
+					Predict
+				</button>
+				<button
+					title="Cancel prediction (Escape)"
+					disabled=${!cancel || sessionEndpointConnecting}
+					onClick=${cancel}>
+					Cancel
+				</button>
+				<div className="shorts">
+					<button
+						title="Regenerate (Ctrl + R)"
+						disabled=${!undoStack.current.length}
+						onClick=${() => undoAndPredict()}
+						onMouseEnter=${() => setUndoHovered(true)}
+						onMouseLeave=${() => setUndoHovered(false)}>
+						<${SVG_Regen}/>
+					</button>
+				</div>
+
+				<div className="shorts">
+					<button
+						title="Undo (Ctrl + Z)"
+						disabled=${!!cancel || !undoStack.current.length}
+						onClick=${() => undo()}
+						onMouseEnter=${() => setUndoHovered(true)}
+						onMouseLeave=${() => setUndoHovered(false)}>
+						<${SVG_Undo}/>
+					</button>
+					<button
+						title="Redo (Ctrl + Y)"
+						disabled=${!!cancel || !redoStack.current.length}
+						onClick=${() => redo()}>
+						<${SVG_Redo}/>
+					</button>
+				</div>
+				<button
+					id="button-settings"
+					onClick=${() => {
+						toggleModal("settings");
+						document.getElementsByClassName("SelectBox")[0].style.display = modalState.settings ? "none" : "block";
+						document.getElementsByClassName("horz-separator")[0].style.display = modalState.settings ? "none" : "block";
+						for (const collapseGroup of document.getElementsByClassName("collapsible-group"))
+							collapseGroup.style.display = modalState.settings ? "none" : "block";
+					}}>
+					<${SVG_MobileSidebar}/>
+				</button>
+			</div>
+			${!!lastError && html`
+				<span className="error-text">${lastError}</span>`}
+		</div>
+
+		<${EditorPreferencesModal}
+			isOpen=${modalState.prompt}
+			closeModal=${() => closeModal("prompt")}>
+			<${InputSlider} label="Font size multiplier" min="0.5" max="5" step="0.01" strict="1"
+				value=${fontSizeMultiplier} onValueChange=${setFontSizeMultiplier}/>
+			<${Checkbox} label="Enable spell checking"
+				value=${spellCheck} onValueChange=${setSpellCheck}/>
+			<${Checkbox} label="Attach sidebar"
+				value=${attachSidebar} onValueChange=${setAttachSidebar}/>
+			<${Checkbox} label="Preserve cursor position after prediction (disabled in Chat Mode)"
+				value=${preserveCursorPosition} onValueChange=${setPreserveCursorPosition}/>
+			<${SelectBox}
+				label="Token highlight"
+				value=${tokenHighlightMode}
+				onValueChange=${setTokenHighlightMode}
+				options=${[
+					{ name: 'Show on editor hover', value: 0 },
+					{ name: 'Show on token hover', value: 1 },
+					{ name: 'Hide', value: -1 },
+				]}/>
+			${tokenHighlightMode !== -1 && html`
+				<${SelectBox}
+					label="Token highlight color"
+					value=${tokenColorMode}
+					onValueChange=${setTokenColorMode}
+					options=${[
+						{ name: 'Default', value: 0 },
+						{ name: 'Color by probability', value: 1 },
+						{ name: 'Color by perplexity', value: 2 },
+					]}/>
+				<${SelectBox}
+					label="Token probability display"
+					value=${showProbsMode}
+					onValueChange=${setShowProbsMode}
+					options=${[
+						{ name: 'Show on hover', value: 0 },
+						{ name: 'Show on hover while holding CTRL', value: 1 },
+						{ name: 'Hide', value: -1 },
+					]}/>`}
+			<div style=${{ display: 'flex', justifyContent: 'flex-start' }}>
+				<button onClick=${() => exportText(`${sessionStorage.getProperty('name')}.txt`, promptArea.current.value)}>
+					Export prompt to plaintext
+				</button>
+			</div>
+		</${EditorPreferencesModal}>
+
+		<${MemoryModal}
+			isOpen=${modalState.memory}
+			closeModal=${() => closeModal("memory")}
+			memoryTokens=${memoryTokens}
+			handleMemoryTokensChange=${handleMemoryTokensChange}
+			cancel=${cancel}/>
+
+		<${AuthorNoteModal}
+			isOpen=${modalState.an}
+			closeModal=${() => closeModal("an")}
+			authorNoteTokens=${authorNoteTokens}
+			handleauthorNoteTokensChange=${handleauthorNoteTokensChange}
+			authorNoteDepth=${authorNoteDepth}
+			setAuthorNoteDepth=${setAuthorNoteDepth}
+			cancel=${cancel}/>
+
+		<${ContextModal}
+			isOpen=${modalState.context}
+			closeModal=${() => closeModal("context")}
+			tokens=${tokens}
+			memoryTokens=${memoryTokens}
+			authorNoteTokens=${authorNoteTokens}
+			handleMemoryTokensChange=${handleMemoryTokensChange}
+			finalPromptText=${useChatAPI ? JSON.stringify(convertChatToJSON(finalPromptText, templates[selectedTemplate]), null, 4) : finalPromptText}
+			defaultPresets=${defaultPresets}
+			cancel=${cancel}/>
+
+		<${WorldInfoModal}
+			isOpen=${modalState.wi}
+			closeModal=${() => closeModal("wi")}
+			worldInfo=${worldInfo}
+			setWorldInfo=${setWorldInfo}
+			toggleModal=${toggleModal}
+			setSillyTarvernWorldInfoJSON=${setSillyTarvernWorldInfoJSON}
+			cancel=${cancel}/>
+
+		<${WorldInfoSelectImportBehaviorModal}
+			isOpen=${modalState.wiImportMode}
+			closeModal=${() => closeModal("wiImportMode")}
+			setWorldInfo=${setWorldInfo}
+			sillyTarvernWorldInfoJSON=${sillyTarvernWorldInfoJSON}
+			cancel=${cancel}/>
+
+		<!-- TODO: The amount of parameters in this modal is a bit excessive... -->
+		<${LogitBiasModal}
+			isOpen=${modalState.bias}
+			closeModal=${() => closeModal("bias")}
+			logitBias=${logitBias}
+			setLogitBias=${setLogitBias}
+			logitBiasParam=${logitBiasParam}
+			setLogitBiasParam=${setLogitBiasParam}
+			sessionStorage=${sessionStorage} endpoint=${endpoint} endpointAPI=${endpointAPI} endpointAPIKey=${endpointAPIKey} isMikupadEndpoint=${isMikupadEndpoint}
+			cancel=${cancel}/>
+
+		<!-- Sorry. -->
+		<${InstructTemplatesModal}
+			isOpen=${modalState.instructTemplates}
+			closeModal=${() => closeModal("instructTemplates")}
+			templateList=${templateList}
+			setTemplateList=${setTemplateList}
+			selectedTemplate=${selectedTemplate}
+			setSelectedTemplate=${setSelectedTemplate}
+			templatesImport=${templatesImport}
+			templates=${templates}
+			setTemplates=${setTemplates}
+			templateStorage=${templateStorage}
+			cancel=${cancel}/>
+
+		<${GrammarModal}
+			isOpen=${modalState.grammar}
+			closeModal=${() => closeModal("grammar")}
+			grammar=${grammar}
+			setGrammar=${setGrammar}
+			endpointAPI=${endpointAPI}
+			cancel=${cancel}/>
+
+		<${InstructModal}
+			isOpen=${modalState.instruct}
+			closeModal=${() => {
+				closeModal("instruct");
+				promptArea.current.focus();
+				promptArea.current.setSelectionRange(instructModalState.selectionStart, instructModalState.selectionEnd);
+			}}
+			predict=${predict}
+			cancel=${cancel}
+			modalState=${instructModalState}
+			templates=${templates}
+			selectedTemplate=${selectedTemplate}
+			lastError=${lastError}
+			sessionEndpointConnecting=${sessionEndpointConnecting}
+			predictStartTokens=${predictStartTokens}
+			tokens=${tokens}
+			stoppingStringsError=${stoppingStringsError}
+			drySequenceBreakersError=${drySequenceBreakersError}
+			bannedTokensError=${bannedTokensError}/>
+
+		<${EditorContextMenu}
+			isOpen=${contextMenuState.visible}
+			closeMenu=${() => setContextMenuState({ visible: false, x: 0, y: 0 })}
+			x=${contextMenuState.x}
+			y=${contextMenuState.y}
+			menuItems=${[
+				{
+					label: 'Instruct Here...',
+					action: () => {
+						const elem = promptArea.current;
+						if (!elem)
+							return;
+
+						const startPos = elem.selectionStart;
+						const endPos = elem.selectionEnd;
+
+						setInstructModalState({
+							selectionStart: startPos,
+							selectionEnd: endPos,
+							instructContext: elem.value.substring(0, startPos) || "",
+							selectedText: elem.value.substring(startPos, endPos),
+						});
+						toggleModal("instruct");
+					},
+					disabled: false
+				},
+				{
+					label: 'Predict Here',
+					action: () => {
+						const elem = promptArea.current;
+						if (!elem)
+							return;
+
+						if (elem.selectionStart === elem.value.length) {
+							predict();
+							return;
+						}
+
+						const startPos = elem.selectionStart;
+						const textBefore = elem.value.substring(0, startPos) || "";
+						const textAfter = elem.value.substring(startPos);
+
+						const finalText = textBefore 
+										+ '{predict}'
+										+ textAfter;
+
+						elem.value = finalText;
+						onInput({ target: elem });
+						setTriggerPredict(true);
+					},
+					disabled: false
+				},
+				{
+					label: 'Fill-In-The-Middle Here',
+					action: () => {
+						const elem = promptArea.current;
+						if (!elem)
+							return;
+
+						const startPos = elem.selectionStart;
+						const textBefore = elem.value.substring(0, startPos) || "";
+						const textAfter = elem.value.substring(startPos);
+
+						const finalText = textBefore 
+										+ '{fill}'
+										+ textAfter;
+
+						elem.value = finalText;
+						onInput({ target: elem });
+						setTriggerPredict(true);
+					},
+					disabled: templates[selectedTemplate]?.fimTemplate === undefined || templates[selectedTemplate]?.fimTemplate.length === 0
+				},
+				{
+					label: 'Insert...',
+					subItems: [
+						{ 'label': 'System Template', action: () => insertTemplate("sys"), disabled: false },
+						{ 'label': 'Instruct Template', action: () => insertTemplate("inst"), disabled: false },
+					],
+					disabled: false
+				},
+			]}/>
+
+		${sessionEndpointError && html`
+			<div className="modal-overlay">
+				<div id="error-bar">
+					<div>
+						${sessionEndpointError}
+					</div>
+				</div>
+			</div>`}
+	`;
+}
+
+async function main() {
+	let dbAdapter = new IndexedDBAdapter();
+	let isMikupadEndpoint = false;
+
+	if (window.location.protocol != 'file:' && window.location.pathname == '/') {
+		let serverAdapter = new ServerDBAdapter(window.location.protocol + '//' + window.location.host);
+		try {
+			await serverAdapter.init();
+			dbAdapter = serverAdapter;
+			isMikupadEndpoint = true;
+		} catch (e) {
+			reportError(e);
+		}
+	}
+	
+	if (!isMikupadEndpoint) {
+		// Initialize IndexedDBAdapter
+		await dbAdapter.init();
+	}
+
+	const sessionStorage = new SessionStorage(dbAdapter);
+	await sessionStorage.init();
+
+	const templateStorage = new TemplateStorage(dbAdapter);
+	await templateStorage.init();
+
+	createRoot(document.body).render(html`
+		<${App}
+			sessionStorage=${sessionStorage}
+			templateStorage=${templateStorage}
+			useSessionState=${(name, initialState) => useSessionState(sessionStorage, name, initialState)}
+			useDBTemplates=${(initialState => useDBTemplates(templateStorage, initialState))}
+			isMikupadEndpoint=${isMikupadEndpoint}/>`);
+}
+
+main();
