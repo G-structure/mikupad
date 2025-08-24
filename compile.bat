@@ -12,9 +12,11 @@ if %errorlevel% neq 0 (
 )
 
 xcopy /y mikupad.html project >NUL
+xcopy /y mikupad.css project >NUL
 
 cd project
 call npm install
 call npm start build
 copy /y .\dist\mikupad.html ..\mikupad_compiled.html
+copy /y .\dist\mikupad*.css ..\mikupad_compiled.css
 cd ..

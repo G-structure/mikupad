@@ -10,10 +10,11 @@ if ! command -v npm > /dev/null 2>&1; then
     exit 1
 fi
 
-cp -f mikupad.html project
+cp -f mikupad.html mikupad.css project
 
 cd project
 npm install
 npm run build
 cp -f ./dist/mikupad.html ../mikupad_compiled.html
+cp -f ./dist/mikupad*.css ../mikupad_compiled.css
 cd ..

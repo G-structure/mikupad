@@ -79,6 +79,8 @@ jobs:
         tag_name: release${{ steps.build_ids.outputs.number }}
         name: ${{ steps.build_ids.outputs.buildName }}
         body_path: CHANGELOG.txt 
-        files: mikupad_compiled.html
+        files: |
+          mikupad_compiled.html
+          mikupad_compiled.css
         token: ${{ secrets.GITHUB_TOKEN }}
 
