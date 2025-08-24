@@ -34,7 +34,7 @@ open mikupad.html
 ```
 To use **mikupad** fully offline, run the provided `compile` script or download the pre-compiled `mikupad_compiled.html` file from [Releases](https://github.com/lmg-anon/mikupad/releases/latest). The compiled build bundles the app with Parcel, producing `mikupad_compiled.html`, `mikupad_compiled.css`, and `mikupad_compiled.js` so it can run without external dependencies.
 
-You can also [try it on GitHub Pages](https://lmg-anon.github.io/mikupad/mikupad.html).
+You can also [try it on GitHub Pages](https://lmg-anon.github.io/mikupad/).
 
 ## Contributing
 
